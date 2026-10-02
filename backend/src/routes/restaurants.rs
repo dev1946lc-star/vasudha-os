@@ -54,6 +54,8 @@ pub async fn get_restaurants(
         r#"
         SELECT COUNT(*)::BIGINT FROM restaurants
         WHERE company_id = $1
+          -- Soft-deleted rows stay for history but must not be listed or counted.
+          AND deleted_at IS NULL
           AND ($2 = '' OR name ILIKE $2 OR phone ILIKE $2 OR contact_person ILIKE $2)
           AND ($3::BOOL IS NULL OR is_active = $3)
         "#,
@@ -81,6 +83,7 @@ pub async fn get_restaurants(
             payment_terms_days
         FROM restaurants
         WHERE company_id = $1
+          AND deleted_at IS NULL
           AND ($2 = '' OR name ILIKE $2 OR phone ILIKE $2 OR contact_person ILIKE $2)
           AND ($3::BOOL IS NULL OR is_active = $3)
         ORDER BY name

@@ -37,8 +37,16 @@ pub async fn get_inventory(
         JOIN products p ON p.id = i.product_id
         WHERE i.company_id = $1
           AND p.company_id = $1
+          -- Soft-deleted products stay visible on their past invoices but must
+          -- not clutter the stock-take list.
+          AND p.deleted_at IS NULL
         ORDER BY
-            (i.quantity < COALESCE(p.min_stock_level, 0)) DESC,
+            -- Most negative first, then low, then by name. A negative quantity
+            -- means a recorded delivery exceeded the count, which needs a recount
+            -- more urgently than a merely low one.
+            CASE WHEN i.quantity < 0 THEN 0
+                 WHEN i.quantity < COALESCE(p.min_stock_level, 0) THEN 1
+                 ELSE 2 END,
             p.name ASC
         "#
     )

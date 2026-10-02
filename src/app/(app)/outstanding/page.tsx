@@ -101,10 +101,14 @@ export default async function OutstandingTrackingPage({
               <tr className="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200">
                 <th className="px-6 py-4 font-medium">Restaurant</th>
                 <th className="px-6 py-4 font-medium text-center">Unpaid Invoices</th>
-                <th className="px-6 py-4 font-medium text-right">0-15 Days</th>
-                <th className="px-6 py-4 font-medium text-right">16-30 Days</th>
-                <th className="px-6 py-4 font-medium text-right">31-60 Days</th>
-                <th className="px-6 py-4 font-medium text-right">60+ Days</th>
+                {/* Buckets are days PAST DUE. Money inside the payment term is
+                    not overdue, so it gets its own column rather than inflating
+                    the 0-15 bucket. */}
+                <th className="px-6 py-4 font-medium text-right">Not Yet Due</th>
+                <th className="px-6 py-4 font-medium text-right">1-15 Days Overdue</th>
+                <th className="px-6 py-4 font-medium text-right">16-30 Days Overdue</th>
+                <th className="px-6 py-4 font-medium text-right">31-60 Days Overdue</th>
+                <th className="px-6 py-4 font-medium text-right">60+ Days Overdue</th>
                 <th className="px-6 py-4 font-medium text-right">Total Outstanding</th>
                 <th className="px-6 py-4 font-medium text-right">Action</th>
               </tr>
@@ -126,6 +130,9 @@ export default async function OutstandingTrackingPage({
                       ) : (
                         <span className="text-slate-400 text-sm">-</span>
                       )}
+                    </td>
+                    <td className="px-6 py-4 text-right text-sm text-slate-500">
+                      {Number(item.bucket_current) > 0 ? `₹${Number(item.bucket_current).toFixed(2)}` : '-'}
                     </td>
                     <td className="px-6 py-4 text-right text-sm text-slate-600">
                       {Number(item.bucket_0_15) > 0 ? `₹${Number(item.bucket_0_15).toFixed(2)}` : '-'}

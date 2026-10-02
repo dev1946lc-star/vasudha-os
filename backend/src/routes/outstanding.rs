@@ -9,6 +9,9 @@ pub struct OutstandingRow {
     pub restaurant_name: String,
     pub phone: Option<String>,
     pub unpaid_invoice_count: i64,
+    /// Not yet due. Separate from the overdue buckets because "not yet due" is not
+    /// the same claim as "recently due", and merging them inflates 0-15.
+    pub bucket_current: f64,
     pub bucket_0_15: f64,
     pub bucket_15_30: f64,
     pub bucket_30_60: f64,
@@ -34,6 +37,7 @@ pub async fn get_outstanding(
             o.restaurant_name AS restaurant_name,
             o.phone,
             COALESCE(o.unpaid_invoice_count, 0)::BIGINT AS unpaid_invoice_count,
+            CAST(COALESCE(o.bucket_current, 0) AS FLOAT8) AS bucket_current,
             CAST(COALESCE(o.bucket_0_15, 0) AS FLOAT8) AS bucket_0_15,
             CAST(COALESCE(o.bucket_15_30, 0) AS FLOAT8) AS bucket_15_30,
             CAST(COALESCE(o.bucket_30_60, 0) AS FLOAT8) AS bucket_30_60,

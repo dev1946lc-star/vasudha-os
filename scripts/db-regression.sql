@@ -99,9 +99,12 @@ INSERT INTO public.products (id, company_id, name, price, hsn_code, gst_rate, mi
 VALUES ('88888888-8888-8888-8888-888888888888',
         '11111111-1111-1111-1111-111111111111', 'Oil', 100, '15121100', 5, 5);
 
+-- The products trigger (migration 30) now inserts a zero-quantity inventory row
+-- for every new product, so this fixture only has to top it up to 100.
 INSERT INTO public.inventory (company_id, product_id, quantity)
 VALUES ('11111111-1111-1111-1111-111111111111',
-        '88888888-8888-8888-8888-888888888888', 100);
+        '88888888-8888-8888-8888-888888888888', 100)
+ON CONFLICT (company_id, product_id) DO UPDATE SET quantity = 100;
 
 -- Every subsequent statement runs as this company/agent.
 SELECT pg_temp.set_app_metadata('{"company_id":"11111111-1111-1111-1111-111111111111","role":"owner"}');
@@ -242,16 +245,52 @@ SELECT pg_temp.assert_true(
 SELECT pg_temp.assert(
   (SELECT total_amount::TEXT FROM public.collections LIMIT 1), '1000.00',
   'collection total is quantity x unit price');
+-- ── 2. Negative stock warns, and never blocks a real delivery ──────────────
+--
+-- Behaviour changed in migration 30. Previously an oversell RAISEd and the
+-- collection was refused. That is worse than it sounds: the delivery physically
+-- happened, so refusing to record it loses the fact and leaves stock lying about
+-- what left the warehouse. Per the spec, negative stock is allowed and flagged.
+--
+-- The dispatch therefore succeeds and leaves a visible shortfall.
+SELECT pg_temp.record_dispatch(9999, 0);
 
--- ── 2. Overselling is rejected with a clear message ────────────────
+SELECT pg_temp.assert(
+  pg_temp.inventory_qty()::TEXT, '-9913.00',
+  'an oversell is recorded as negative stock rather than refused');
+
+SELECT pg_temp.assert_true(
+  (SELECT status FROM public.collections ORDER BY created_at DESC LIMIT 1) = 'completed',
+  'a delivery that physically happened is still recorded as completed');
+
+SELECT pg_temp.assert_true(
+  pg_temp.inventory_qty() < 0,
+  'negative stock is visible rather than silently clamped to zero');
+
+-- Put the count back so later checks are not reasoning about -9913.
+UPDATE public.inventory SET quantity = 100
+WHERE company_id = '11111111-1111-1111-1111-111111111111'
+  AND product_id = '88888888-8888-8888-8888-888888888888';
+
+-- A product with no stock record at all is a data error, not a count lag, and is
+-- still refused -- otherwise the deduction silently does nothing.
 DO $$
+DECLARE
+  v_product UUID;
 BEGIN
   BEGIN
-    PERFORM pg_temp.record_dispatch(9999, 0);
-    RAISE EXCEPTION 'FAILED: oversell should have been rejected';
+    SELECT id INTO v_product FROM public.products
+    WHERE company_id = '11111111-1111-1111-1111-111111111111' LIMIT 1;
+
+    DELETE FROM public.inventory
+     WHERE company_id = '11111111-1111-1111-1111-111111111111'
+       AND product_id = v_product;
+
+    PERFORM pg_temp.record_dispatch(1, 0);
+    RAISE EXCEPTION 'FAILED: a product with no stock record should be refused';
   EXCEPTION WHEN others THEN
-    IF SQLERRM LIKE '%Insufficient stock%' THEN
-      RAISE NOTICE 'ok  oversell rejected with an actionable message';
+    IF SQLERRM LIKE '%no stock record%' THEN
+      RAISE NOTICE 'ok  a missing stock record is refused as a data error';
     ELSE
       RAISE;
     END IF;
@@ -259,10 +298,27 @@ BEGIN
 END;
 $$;
 
--- The failed dispatch must not have left a partial collection behind.
+-- The refused dispatch (the product with no stock record, above) must not have
+-- left a partial collection behind. The count is 3, not 2, because the oversell
+-- in this section is now deliberately recorded rather than refused.
 SELECT pg_temp.assert_true(
-  (SELECT count(*) FROM public.collections) = 2,
-  'rejected dispatch left no orphan collection');
+  (SELECT count(*) FROM public.collections) = 3,
+  'a refused dispatch leaves no orphan collection');
+
+-- The refused one is specifically the missing-stock-record attempt, so assert on
+-- the shortfall rather than on the total: the oversell is legitimately persisted.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.collections c
+    JOIN public.collection_items ci ON ci.collection_id = c.id
+    WHERE c.notes = 'dispatch'
+      AND ci.quantity = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM public.inventory inv
+        WHERE inv.company_id = c.company_id AND inv.product_id = ci.product_id
+      )
+  ),
+  'the missing-stock-record dispatch wrote no collection row');
 
 -- ── 3. The collection state machine blocks agents ──────────────────
 SELECT pg_temp.set_app_metadata('{"company_id":"11111111-1111-1111-1111-111111111111","role":"agent"}');
@@ -287,19 +343,56 @@ $$;
 SELECT pg_temp.set_app_metadata('{"company_id":"11111111-1111-1111-1111-111111111111","role":"owner"}');
 
 -- ── 4. Bulk invoicing numbers per company and month ────────────────
-UPDATE public.collections SET status = 'verified' WHERE invoice_id IS NULL;
+-- Scope: only the two normal dispatches from section 1. The 9999-unit
+-- oversell from section 2 is also verified and would otherwise dominate the
+-- invoice, so it is excluded by selecting on quantity rather than by
+-- sweeping every collection.
+UPDATE public.collections SET status = 'verified'
+WHERE invoice_id IS NULL
+  AND id IN (SELECT ci.collection_id FROM public.collection_items ci WHERE ci.quantity = 10);
 
 SELECT public.generate_bulk_invoice(
-  ARRAY(SELECT id FROM public.collections WHERE invoice_id IS NULL));
+  ARRAY(SELECT id FROM public.collections WHERE invoice_id IS NULL AND status = 'verified'));
 
 SELECT pg_temp.assert(
   (SELECT invoice_number FROM public.invoices LIMIT 1), 'INV-' ||
     to_char(CURRENT_DATE, 'YYYYMM') || '-0001',
   'first invoice of the month is numbered 0001');
 
+-- Billing is NET of returns. Two dispatches of 10 and 7 with 3 returned:
+--   gross 17 x 100        = 1700.00
+--   returns 3 x 100       = -300.00
+--   taxable               = 1400.00
+--   GST 5% intra-state    =   70.00  (cgst 35.00 + sgst 35.00)
+--   total                = 1470.00
+-- The previous expectation of 2100.00 billed the returned cans in full.
 SELECT pg_temp.assert(
-  (SELECT total_amount::TEXT FROM public.invoices LIMIT 1), '2100.00',
-  'invoice total is 2000 subtotal + 100 GST');
+  (SELECT subtotal::TEXT FROM public.invoices LIMIT 1), '1400.00',
+  'invoice subtotal is net of returns');
+SELECT pg_temp.assert(
+  (SELECT total_amount::TEXT FROM public.invoices LIMIT 1), '1470.00',
+  'invoice total is 1400 subtotal + 70 GST');
+SELECT pg_temp.assert(
+  (SELECT cgst::TEXT FROM public.invoices LIMIT 1), '35.00',
+  'cgst is half the GST for an intra-state supply');
+SELECT pg_temp.assert(
+  (SELECT igst::TEXT FROM public.invoices LIMIT 1), '0.00',
+  'igst is zero when both parties are in the same state');
+
+-- One bill_items row per product, carrying the net quantity and a frozen split.
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.bill_items WHERE invoice_id = (
+     SELECT id FROM public.invoices LIMIT 1)), '1',
+  'a single-product invoice produces exactly one bill line');
+SELECT pg_temp.assert(
+  (SELECT quantity::TEXT FROM public.bill_items LIMIT 1), '14.00',
+  'bill line quantity is net of returns');
+SELECT pg_temp.assert(
+  (SELECT (gross_quantity - return_quantity)::TEXT FROM public.bill_items LIMIT 1), '14.00',
+  'gross minus returns reconciles with the billed quantity');
+SELECT pg_temp.assert(
+  (SELECT (cgst + sgst + igst)::TEXT FROM public.bill_items LIMIT 1), '70.00',
+  'bill line tax split sums to the invoice GST');
 
 SELECT pg_temp.assert_true(
   (SELECT count(*) FROM public.collections WHERE invoice_id IS NOT NULL) = 2,
@@ -358,6 +451,107 @@ BEGIN
 END;
 $$;
 
+-- ── 4b. GST state detection (migration 29) ───────────────────────────────
+-- The head of a GSTIN is the state code. These are the inputs to the CGST+SGST
+-- vs IGST split, so the edge cases (missing, truncated, non-numeric) matter:
+-- a wrong answer here is wrong tax on a real invoice.
+SELECT pg_temp.assert(
+  public.gst_state_code('27AAAAA1234A1Z5')::TEXT, '27',
+  'a GSTIN head yields its numeric state code');
+SELECT pg_temp.assert(
+  coalesce(public.gst_state_code(NULL)::TEXT, '<null>'), '<null>',
+  'an absent GSTIN has no state code');
+SELECT pg_temp.assert(
+  coalesce(public.gst_state_code('27')::TEXT, '<null>'), '<null>',
+  'a 2-character GSTIN is too short to carry a state code');
+SELECT pg_temp.assert(
+  coalesce(public.gst_state_code('27AAAAA1234A1Z')::TEXT, '<null>'), '<null>',
+  'a 14-character GSTIN is one character short of a valid GSTIN');
+SELECT pg_temp.assert(
+  coalesce(public.gst_state_code('XYAAAAA1234A1Z5')::TEXT, '<null>'), '<null>',
+  'a non-numeric state code is rejected rather than cast');
+
+SELECT pg_temp.assert_true(
+  public.is_inter_state_supply('27AAAAA1234A1Z5', '29BBBBB1234B1Z5'),
+  'different state codes mean an inter-state supply');
+SELECT pg_temp.assert_true(
+  NOT public.is_inter_state_supply('27AAAAA1234A1Z5', '27BBBBB1234B1Z5'),
+  'matching state codes mean an intra-state supply');
+SELECT pg_temp.assert_true(
+  NOT public.is_inter_state_supply('27AAAAA1234A1Z5', NULL),
+  'an unregistered buyer is billed intra-state (CGST+SGST)');
+SELECT pg_temp.assert_true(
+  NOT public.is_inter_state_supply(NULL, NULL),
+  'two absent GSTINs do not manufacture an inter-state supply');
+
+-- ── 4c. Ageing is measured from due_date (migration 14b) ──────────────────
+-- The old definition computed CURRENT_DATE - invoice_date and called the column
+-- "days_overdue", so an invoice inside its payment term was reported as overdue.
+-- These fixtures are 15-day terms, chosen so the naive and correct answers differ.
+
+-- A dedicated restaurant, so the buckets below are measured in isolation from the
+-- other fixtures that share the tenant.
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days)
+VALUES ('dddddddd-0000-4000-8000-00000000000d',
+        '11111111-1111-1111-1111-111111111111', 'Ageing Probe', 15);
+
+-- Dated today, due in 15 days: NOT overdue, however the invoice ages later.
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES ('dd000000-0000-4000-8000-000000000001',
+        '11111111-1111-1111-1111-111111111111',
+        'dddddddd-0000-4000-8000-00000000000d',
+        'INV-AGE-0001', CURRENT_DATE, CURRENT_DATE + 15, 400, 400, 'unpaid');
+
+-- Dated 40 days ago, due 25 days ago: 25 days overdue -> the 16-30 bucket.
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES ('dd000000-0000-4000-8000-000000000002',
+        '11111111-1111-1111-1111-111111111111',
+        'dddddddd-0000-4000-8000-00000000000d',
+        'INV-AGE-0002', CURRENT_DATE - 40, CURRENT_DATE - 25, 600, 600, 'unpaid');
+
+SELECT pg_temp.assert(
+  (SELECT bucket::TEXT FROM public.invoice_aging
+    WHERE id = 'dd000000-0000-4000-8000-000000000001'), 'current',
+  'an invoice inside its payment term buckets as current, not overdue');
+
+SELECT pg_temp.assert(
+  (SELECT bucket::TEXT FROM public.invoice_aging
+    WHERE id = 'dd000000-0000-4000-8000-000000000002'), '16-30',
+  'days_overdue is counted from due_date, landing in 16-30');
+
+SELECT pg_temp.assert(
+  (SELECT days_overdue::TEXT FROM public.invoice_aging
+    WHERE id = 'dd000000-0000-4000-8000-000000000001'), '-15',
+  'a not-yet-due invoice reports negative days_overdue');
+
+-- The restaurant rollup must keep the two apart, otherwise "current" money is
+-- silently folded into the first overdue bucket.
+SELECT pg_temp.assert(
+  (SELECT bucket_current::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'dddddddd-0000-4000-8000-00000000000d'), '400.00',
+  'not-yet-due money is reported separately from the overdue buckets');
+
+SELECT pg_temp.assert_true(
+  (SELECT bucket_15_30 FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'dddddddd-0000-4000-8000-00000000000d') >= 600,
+  'overdue money is bucketed by days past due');
+
+-- The total must still equal current + overdue, or the header figure and the
+-- columns underneath it would disagree.
+SELECT pg_temp.assert(
+  (SELECT total_outstanding::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'dddddddd-0000-4000-8000-00000000000d'),
+  (SELECT (bucket_current + bucket_0_15 + bucket_15_30 + bucket_30_60 + bucket_60_plus)::TEXT
+     FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'dddddddd-0000-4000-8000-00000000000d'),
+  'outstanding total equals the sum of every bucket including not-yet-due');
+
+-- Clean up so the later status-machine checks see the fixture they expect.
+DELETE FROM public.invoices WHERE restaurant_id = 'dddddddd-0000-4000-8000-00000000000d';
+DELETE FROM public.restaurants WHERE id = 'dddddddd-0000-4000-8000-00000000000d';
+
 -- Invoice numbers are unique per company.
 SELECT pg_temp.assert_true(
   (SELECT count(*) FROM (
@@ -367,12 +561,18 @@ SELECT pg_temp.assert_true(
   'no duplicate invoice numbers');
 
 -- ── 5. Invoice status transitions ───────────────────────────────────
+-- due_date is NOT NULL since migration 29. Real invoices get it from the
+-- restaurant's payment_terms_days inside generate_bulk_invoice; this row is
+-- inserted directly by the test, so the term is supplied here.
 INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
-                             invoice_date, subtotal, total_amount, status)
+                             invoice_date, due_date, subtotal, total_amount, status)
 VALUES ('33333333-3333-3333-3333-333333333333',
         '11111111-1111-1111-1111-111111111111',
         '22222222-2222-2222-2222-222222222222',
-        'INV-TEST-0001', CURRENT_DATE, 1000, 1000, 'unpaid');
+        'INV-TEST-0001', CURRENT_DATE,
+        CURRENT_DATE + COALESCE((SELECT payment_terms_days FROM public.restaurants
+                                  WHERE id = '22222222-2222-2222-2222-222222222222'), 15),
+        1000, 1000, 'unpaid');
 
 INSERT INTO public.payments (id, company_id, restaurant_id, invoice_id, amount, payment_date)
 VALUES ('44444444-4444-4444-4444-444444444444',
@@ -413,11 +613,11 @@ SELECT pg_temp.assert(
 DELETE FROM public.payments WHERE id = '44444444-4444-4444-4444-444444444444';
 
 INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
-                             invoice_date, subtotal, total_amount, status)
+                             invoice_date, due_date, subtotal, total_amount, status)
 VALUES ('66666666-6666-6666-6666-666666666666',
         '11111111-1111-1111-1111-111111111111',
         '22222222-2222-2222-2222-222222222222',
-        'INV-TEST-0002', CURRENT_DATE, 500, 500, 'unpaid');
+        'INV-TEST-0002', CURRENT_DATE, CURRENT_DATE + 15, 500, 500, 'unpaid');
 
 -- Re-open the cancelled invoice so it participates in the status machine again.
 UPDATE public.invoices SET status = 'unpaid'
@@ -758,7 +958,428 @@ BEGIN
 END;
 $$;
 
--- Everything below already asserted RPC behaviour with a fabricated caller.
+-- ── 7. Stock records and soft delete (migration 30) ───────────────────────
+-- Still as the superuser, because creating a product needs the table owner and
+-- these are structural checks rather than policy checks.
+
+-- Every product has a stock record. Without this a new product cannot be
+-- dispatched at all, and is invisible on /inventory (INNER JOIN).
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.products p
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.inventory i
+      WHERE i.company_id = p.company_id AND i.product_id = p.id
+    )), '0',
+  'every product has an inventory row, so none is undispatchable');
+
+-- And a product created from now on gets one automatically.
+INSERT INTO public.products (id, company_id, name, price, hsn_code, gst_rate, min_stock_level)
+VALUES ('ee000000-0000-4000-8000-000000000001',
+        '11111111-1111-1111-1111-111111111111', 'Auto Stock Product', 50, '15121110', 5, 0);
+
+SELECT pg_temp.assert(
+  (SELECT quantity::TEXT FROM public.inventory
+    WHERE company_id = '11111111-1111-1111-1111-111111111111'
+      AND product_id = 'ee000000-0000-4000-8000-000000000001'), '0.00',
+  'inserting a product creates its stock record at zero');
+
+-- Soft delete: the row survives so its invoices keep a valid referent.
+SELECT pg_temp.set_claims(jsonb_build_object(
+  'sub', 'user_2ownerTEST000000000001',
+  'role', 'authenticated',
+  'app_metadata', jsonb_build_object(
+    'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'owner')
+)::TEXT);
+
+-- A dedicated restaurant with exactly one unpaid bill, so the balance is known
+-- and settling it is a single step. Reusing the shared Test Restaurant would
+-- inherit an unrelated 2470.00 from the invoice-status section above.
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days, credit_limit)
+VALUES ('ffff0000-0000-4000-8000-00000000000f',
+        '11111111-1111-1111-1111-111111111111', 'Removal Probe', 15, 500);
+
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES ('ff000000-0000-4000-8000-000000000001',
+        '11111111-1111-1111-1111-111111111111',
+        'ffff0000-0000-4000-8000-00000000000f',
+        'INV-DEL-' || to_char(CURRENT_DATE, 'YYYYMMDD'), CURRENT_DATE, CURRENT_DATE + 15, 300, 300, 'unpaid');
+
+DO $$
+DECLARE
+  v_probe CONSTANT UUID := 'ffff0000-0000-4000-8000-00000000000f';
+BEGIN
+  -- Refused while money is owed, with the amount named so the user can act.
+  BEGIN
+    PERFORM public.delete_restaurant(v_probe);
+    RAISE EXCEPTION 'FAILED: a restaurant with an outstanding balance must not be removed';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%still outstanding%' THEN
+      RAISE NOTICE 'ok  removal refused while money is still owed';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- Settle the balance in full, then removal succeeds.
+  INSERT INTO public.payments (id, company_id, restaurant_id, invoice_id, amount, payment_date)
+  VALUES ('ff000000-0000-4000-8000-000000000002',
+          '11111111-1111-1111-1111-111111111111', v_probe,
+          'ff000000-0000-4000-8000-000000000001', 300, CURRENT_DATE);
+
+  PERFORM public.delete_restaurant(v_probe);
+END;
+$$;
+
+SELECT pg_temp.assert_true(
+  EXISTS (SELECT 1 FROM public.restaurants
+    WHERE id = 'ffff0000-0000-4000-8000-00000000000f' AND deleted_at IS NOT NULL),
+  'removal marks the restaurant deleted instead of dropping the row');
+
+SELECT pg_temp.assert_true(
+  EXISTS (SELECT 1 FROM public.invoices
+    WHERE id = 'ff000000-0000-4000-8000-000000000001'),
+  'the removed restaurant keeps its invoices, so history survives');
+
+-- Deleted restaurants drop out of the money figures.
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'ffff0000-0000-4000-8000-00000000000f'), '0',
+  'a deleted restaurant disappears from outstanding');
+
+-- And removal is reversible.
+SELECT public.restore_restaurant('ffff0000-0000-4000-8000-00000000000f');
+
+SELECT pg_temp.assert_true(
+  EXISTS (SELECT 1 FROM public.restaurants
+    WHERE id = 'ffff0000-0000-4000-8000-00000000000f' AND deleted_at IS NULL),
+  'a mistaken removal can be undone');
+
+-- credit_limit was stored and displayed but never enforced. This is the helper
+-- that makes it checkable.
+UPDATE public.restaurants SET credit_limit = 500
+WHERE id = 'ffff0000-0000-4000-8000-00000000000f';
+
+SELECT pg_temp.assert_true(
+  (SELECT exceeded FROM public.restaurant_credit_status(
+     'ffff0000-0000-4000-8000-00000000000f', 600)),
+  'a delivery past the credit limit is flagged');
+
+SELECT pg_temp.assert_true(
+  NOT (SELECT exceeded FROM public.restaurant_credit_status(
+     'ffff0000-0000-4000-8000-00000000000f', 100)),
+  'a delivery within the credit limit is not flagged');
+
+SELECT pg_temp.assert_true(
+  NOT (SELECT exceeded FROM public.restaurant_credit_status(
+     'ffff0000-0000-4000-8000-00000000000f', 0)),
+  'credit_limit = 0 means unlimited, not zero allowance');
+
+-- ── 8. Advance payments and FIFO allocation (migration 31) ────────────────
+-- The everyday case: a restaurant pays a round number against several bills,
+-- or pays before the period is even billed. Both were unrepresentable before.
+
+-- A restaurant with three open bills on a known, controlled timeline.
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days)
+VALUES ('aa000000-0000-4000-8000-00000000000a',
+        '11111111-1111-1111-1111-111111111111', 'FIFO Probe', 15);
+
+-- Oldest first. due_date drives the order; invoice_date breaks ties.
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES
+  ('ab000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'aa000000-0000-4000-8000-00000000000a',
+   'INV-FIFO-' || to_char(CURRENT_DATE, 'YYYYMM') || '-1',
+   CURRENT_DATE - 40, CURRENT_DATE - 25, 300, 300, 'unpaid'),
+  ('ab000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
+   'aa000000-0000-4000-8000-00000000000a',
+   'INV-FIFO-' || to_char(CURRENT_DATE, 'YYYYMM') || '-2',
+   CURRENT_DATE - 20, CURRENT_DATE - 5, 400, 400, 'unpaid'),
+  ('ab000000-0000-4000-8000-000000000003', '11111111-1111-1111-1111-111111111111',
+   'aa000000-0000-4000-8000-00000000000a',
+   'INV-FIFO-' || to_char(CURRENT_DATE, 'YYYYMM') || '-3',
+   CURRENT_DATE - 2, CURRENT_DATE + 13, 500, 500, 'unpaid');
+
+SELECT pg_temp.set_claims(jsonb_build_object(
+  'sub', 'user_2ownerTEST000000000001',
+  'role', 'authenticated',
+  'app_metadata', jsonb_build_object(
+    'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'owner')
+)::TEXT);
+
+-- (a) 500 against a 300 oldest bill and part of the 400 next: spills across both.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 500, 'cash', NULL, CURRENT_DATE, 'ADV-1');
+
+  PERFORM pg_temp.assert(r.allocated::TEXT, '500.00',
+    'a 500 payment against 300+400 open bills allocates in full');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '0.00',
+    'no credit is left when the payment is fully absorbed');
+  PERFORM pg_temp.assert(r.invoices_hit::TEXT, '2',
+    'the payment settles the oldest bill first, then spills onto the next');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000001'),
+  'paid', 'the oldest bill is settled first, not the newest');
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000002'),
+  'partial', 'the spill leaves the second bill partially paid');
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000003'),
+  'unpaid', 'the newest bill is untouched');
+
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.payment_allocations
+    WHERE invoice_id = 'ab000000-0000-4000-8000-000000000001'), '300.00',
+  'the oldest bill absorbed exactly its own total');
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.payment_allocations
+    WHERE invoice_id = 'ab000000-0000-4000-8000-000000000002'), '200.00',
+  'the remainder is recorded against the next oldest bill');
+
+-- (b) An advance with nothing to absorb it becomes credit, not a lost payment.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 1000, 'upi', NULL, CURRENT_DATE, 'ADV-2');
+
+  PERFORM pg_temp.assert(r.allocated::TEXT, '400.00',
+    'an advance settles the remaining 200 on bill 2 and 400 of bill 3');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '600.00',
+    'the unabsorbed remainder is held as credit rather than disappearing');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.restaurant_credit
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '600.00',
+  'restaurant_credit holds the overpayment');
+
+-- This is the defect being fixed: the surplus used to vanish from the
+-- money-owed figures because the views filtered on status.
+SELECT pg_temp.assert(
+  (SELECT credit_balance::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '600.00',
+  'credit is visible on the outstanding report instead of vanishing');
+
+-- (c) A later payment spends the existing credit before touching new bills.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                               invoice_date, due_date, subtotal, total_amount, status)
+  VALUES ('ab000000-0000-4000-8000-000000000004', '11111111-1111-1111-1111-111111111111',
+          'aa000000-0000-4000-8000-00000000000a',
+          'INV-FIFO-' || to_char(CURRENT_DATE, 'YYYYMM') || '-4',
+          CURRENT_DATE, CURRENT_DATE + 15, 900, 900, 'unpaid');
+
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 500, 'cash', NULL, CURRENT_DATE, 'ADV-3');
+
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '100.00',
+    'the new payment draws down the 600 of credit before allocating');
+  PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
+    'with credit available the whole payment is consumed by it');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000004'),
+  'unpaid', 'held credit does not settle a bill raised after it arrived');
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.restaurant_credit
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '100.00',
+  'the remaining credit balance is still carried');
+
+-- (d) A payment with no invoice and nothing outstanding is pure credit.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 250, 'cash', NULL, CURRENT_DATE, 'ADV-4');
+
+  PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
+    'a payment with nothing to absorb is not allocated to anything');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '350.00',
+    'it simply increases the credit held');
+END;
+$$;
+
+-- (e) Guards. A zero payment, a foreign restaurant, and a mismatched invoice
+-- must all be refused rather than silently recorded.
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.record_payment(
+      'aa000000-0000-4000-8000-00000000000a', 0, 'cash');
+    RAISE EXCEPTION 'FAILED: a zero payment should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%greater than zero%' THEN
+      RAISE NOTICE 'ok  a zero-amount payment is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  BEGIN
+    PERFORM public.record_payment(
+      'aaaaaaaa-2222-4222-8222-222222222222', 100, 'cash');
+    RAISE EXCEPTION 'FAILED: another tenant''s restaurant should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%does not belong to your company%' THEN
+      RAISE NOTICE 'ok  paying against another tenant''s restaurant is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  BEGIN
+    -- An invoice belonging to a different restaurant must not settle this bill.
+    PERFORM public.record_payment(
+      'aa000000-0000-4000-8000-00000000000a', 100, 'cash',
+      '33333333-3333-3333-3333-333333333333');
+    RAISE EXCEPTION 'FAILED: a mismatched invoice should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%does not belong to that restaurant%' THEN
+      RAISE NOTICE 'ok  a payment cannot settle another restaurant''s bill';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- (f) FIFO follows due_date, not creation order.
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days)
+VALUES ('aa000000-0000-4000-8000-00000000000b',
+        '11111111-1111-1111-1111-111111111111', 'Order Probe', 15);
+
+-- Deliberately inserted newest-first, so a naive ORDER BY id would settle the
+-- wrong bill. The later due_date must win.
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES
+  ('ac000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'aa000000-0000-4000-8000-00000000000b',
+   'INV-ORD-' || to_char(CURRENT_DATE, 'YYYYMM') || '-1',
+   CURRENT_DATE - 1, CURRENT_DATE + 14, 700, 700, 'unpaid'),
+  ('ac000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
+   'aa000000-0000-4000-8000-00000000000b',
+   'INV-ORD-' || to_char(CURRENT_DATE, 'YYYYMM') || '-2',
+   CURRENT_DATE - 30, CURRENT_DATE - 15, 700, 700, 'unpaid');
+
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000b', 700, 'cash', NULL, CURRENT_DATE, 'ORD-1');
+
+  PERFORM pg_temp.assert(r.allocated::TEXT, '700.00',
+    'a payment equal to the oldest bill settles exactly that bill');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ac000000-0000-4000-8000-000000000001'),
+  'unpaid', 'the bill due LATER is left alone: FIFO orders by due_date');
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ac000000-0000-4000-8000-000000000002'),
+  'paid', 'the bill due SOONER is settled, not the one inserted first');
+
+-- (g) Batch billing across restaurants: one call, one invoice per restaurant.
+INSERT INTO public.restaurants (id, company_id, name, is_active)
+VALUES
+  ('ad000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111', 'Batch A', TRUE),
+  ('ad000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111', 'Batch B', TRUE);
+
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.inventory WHERE quantity = 500), '1',
+  'only the probe product carries a 500 balance to dispatch');
+
+-- Verified collections for two different restaurants in one selection.
+INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
+                                collection_date, status, total_amount)
+VALUES
+  ('ae000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'ad000000-0000-4000-8000-000000000001', 'user_2ownerTEST000000000001',
+   CURRENT_DATE, 'verified', 0),
+  ('ae000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
+   'ad000000-0000-4000-8000-000000000002', 'user_2ownerTEST000000000001',
+   CURRENT_DATE, 'verified', 0);
+
+INSERT INTO public.collection_items (collection_id, product_id, quantity,
+                                     return_quantity, price_per_unit, amount)
+VALUES
+  ('ae000000-0000-4000-8000-000000000001', '88888888-8888-8888-8888-888888888888', 1, 0, 100, 100),
+  ('ae000000-0000-4000-8000-000000000002', '88888888-8888-8888-8888-888888888888', 2, 0, 100, 200);
+
+DO $$
+DECLARE
+  v_rows INT;
+  v_a UUID;
+  v_b UUID;
+BEGIN
+  SELECT count(*), min(invoice_id), max(invoice_id)
+  INTO v_rows, v_a, v_b
+  FROM public.generate_bulk_invoices_batch(ARRAY[
+    'ae000000-0000-4000-8000-000000000001'::UUID,
+    'ae000000-0000-4000-8000-000000000002'::UUID]);
+
+  -- This is the whole point: the old RPC refused a selection spanning two
+  -- restaurants, so a billing run was one manual cycle per restaurant.
+  PERFORM pg_temp.assert(v_rows::TEXT, '2',
+    'one batch call issues one invoice per restaurant');
+  PERFORM pg_temp.assert_true(v_a IS DISTINCT FROM v_b,
+    'the two restaurants get two distinct invoices');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.bill_items), '2',
+  'each batched invoice gets its own bill line');
+SELECT pg_temp.assert(
+  (SELECT count(DISTINCT invoice_number)::TEXT FROM public.invoices), '2',
+  'the batched invoices have distinct numbers');
+
+-- An unverified collection is skipped, not fatal: one unverified stop must not
+-- block billing the other 199.
+INSERT INTO public.restaurants (id, company_id, name)
+VALUES ('ad000000-0000-4000-8000-000000000003',
+        '11111111-1111-1111-1111-111111111111', 'Batch C');
+
+INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
+                                collection_date, status, total_amount)
+VALUES ('ae000000-0000-4000-8000-000000000003', '11111111-1111-1111-1111-111111111111',
+        'ad000000-0000-4000-8000-000000000003', 'user_2ownerTEST000000000001',
+        CURRENT_DATE, 'completed', 0);
+
+DO $$
+DECLARE
+  v_rows INT;
+BEGIN
+  BEGIN
+    SELECT count(*) INTO v_rows
+    FROM public.generate_bulk_invoices_batch(
+      ARRAY['ae000000-0000-4000-8000-000000000003'::UUID]);
+    PERFORM pg_temp.assert(v_rows::TEXT, '0',
+      'an unverified collection is skipped rather than aborting the batch');
+  EXCEPTION WHEN others THEN
+    RAISE EXCEPTION 'FAILED: an unverified collection broke the whole batch: %', SQLERRM;
+  END;
+END;
+$$;
 
 ROLLBACK;
 

@@ -201,6 +201,7 @@ export interface Database {
           restaurant_id: string
           invoice_number: string
           invoice_date: string
+          due_date: string
           subtotal: number
           cgst: number
           sgst: number
@@ -215,6 +216,7 @@ export interface Database {
           restaurant_id: string
           invoice_number: string
           invoice_date: string
+          due_date: string
           subtotal: number
           cgst?: number
           sgst?: number
@@ -229,6 +231,7 @@ export interface Database {
           restaurant_id?: string
           invoice_number?: string
           invoice_date?: string
+          due_date?: string
           subtotal?: number
           cgst?: number
           sgst?: number
@@ -322,6 +325,8 @@ export interface Database {
           price: number
           gst_rate: number
           is_active: boolean
+          /** Soft-delete marker. NULL means active. */
+          deleted_at: string | null
           min_stock_level: number
           created_at: string
         }
@@ -334,6 +339,7 @@ export interface Database {
           price: number
           gst_rate?: number
           is_active?: boolean
+          deleted_at?: string | null
           min_stock_level?: number
           created_at?: string
         }
@@ -346,6 +352,7 @@ export interface Database {
           price?: number
           gst_rate?: number
           is_active?: boolean
+          deleted_at?: string | null
           min_stock_level?: number
           created_at?: string
         }
@@ -397,6 +404,9 @@ export interface Database {
           credit_limit: number
           payment_terms_days: number
           is_active: boolean
+          /** Soft-delete marker. NULL means active. Rows are kept so
+           *  invoices, payments and collections keep a valid referent. */
+          deleted_at: string | null
           gst_number: string | null
           created_at: string
         }
@@ -410,6 +420,7 @@ export interface Database {
           credit_limit?: number
           payment_terms_days?: number
           is_active?: boolean
+          deleted_at?: string | null
           gst_number?: string | null
           created_at?: string
         }
@@ -423,6 +434,7 @@ export interface Database {
           credit_limit?: number
           payment_terms_days?: number
           is_active?: boolean
+          deleted_at?: string | null
           gst_number?: string | null
           created_at?: string
         }
@@ -459,8 +471,96 @@ export interface Database {
           },
         ]
       }
+      bill_items: {
+        Row: {
+          id: string
+          invoice_id: string
+          product_id: string
+          /** Net of returns: what the customer is charged for. */
+          quantity: number
+          gross_quantity: number
+          return_quantity: number
+          unit_price: number
+          hsn_code: string | null
+          gst_rate: number
+          taxable_amount: number
+          cgst: number
+          sgst: number
+          igst: number
+          total_amount: number
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          invoice_id: string
+          product_id: string
+          quantity: number
+          gross_quantity: number
+          return_quantity?: number
+          unit_price: number
+          hsn_code?: string | null
+          gst_rate?: number
+          taxable_amount: number
+          cgst?: number
+          sgst?: number
+          igst?: number
+          total_amount: number
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          invoice_id?: string
+          product_id?: string
+          quantity?: number
+          gross_quantity?: number
+          return_quantity?: number
+          unit_price?: number
+          hsn_code?: string | null
+          gst_rate?: number
+          taxable_amount?: number
+          cgst?: number
+          sgst?: number
+          igst?: number
+          total_amount?: number
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "bill_items_invoice_id_fkey"
+            columns: ["invoice_id"]
+            isOneToOne: false
+            referencedRelation: "invoices"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "bill_items_product_id_fkey"
+            columns: ["product_id"]
+            isOneToOne: false
+            referencedRelation: "products"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Views: {
+      /** Invoice-level ageing. days_overdue is measured from due_date and is
+       *  NEGATIVE while the invoice is not yet due; `bucket` is 'current' then. */
+      invoice_aging: {
+        Row: {
+          id: string
+          company_id: string
+          restaurant_id: string
+          restaurant_name: string
+          invoice_number: string
+          invoice_date: string
+          due_date: string
+          total_amount: number
+          outstanding_amount: number
+          days_overdue: number
+          bucket: string
+        }
+        Relationships: []
+      }
       invoice_outstanding: {
         Row: {
           invoice_id: string
@@ -468,11 +568,14 @@ export interface Database {
           restaurant_id: string
           invoice_number: string
           invoice_date: string
+          due_date: string
           total_amount: number
           status: string
           paid_amount: number
           outstanding_amount: number
+          /** Measured from due_date. Negative means not yet due. */
           days_overdue: number
+          is_due: string
         }
         Relationships: []
       }
@@ -484,6 +587,8 @@ export interface Database {
           phone: string | null
           unpaid_invoice_count: number
           total_outstanding: number
+          /** Invoiced but still inside the payment term. Not overdue. */
+          bucket_current: number
           bucket_0_15: number
           bucket_15_30: number
           bucket_30_60: number
@@ -598,6 +703,26 @@ export interface Database {
           p_role: string
         }
         Returns: undefined
+      }
+      /** Soft-deletes a restaurant. Refuses while an invoice is still
+       *  outstanding, naming the amount. The row is kept so invoices, payments
+       *  and collections keep a valid referent. */
+      delete_restaurant: {
+        Args: { p_restaurant_id: string }
+        Returns: boolean
+      }
+      restore_restaurant: {
+        Args: { p_restaurant_id: string }
+        Returns: boolean
+      }
+      /** Soft-deletes a product. collection_items and bill_items reference it. */
+      delete_product: {
+        Args: { p_product_id: string }
+        Returns: boolean
+      }
+      restore_product: {
+        Args: { p_product_id: string }
+        Returns: boolean
       }
     }
     Enums: {

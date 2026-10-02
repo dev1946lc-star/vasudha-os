@@ -54,6 +54,8 @@ let total: i64 = sqlx::query_scalar(
     r#"
     SELECT COUNT(*)::BIGINT FROM products
     WHERE company_id = $1
+      -- Soft-deleted rows stay for history but must not be listed or counted.
+      AND deleted_at IS NULL
       AND ($2 = '' OR name ILIKE $2 OR hsn_code ILIKE $2)
       AND ($3::BOOL IS NULL OR is_active = $3)
     "#,
@@ -84,6 +86,7 @@ let rows = sqlx::query_as::<_, Product>(
         CAST(COALESCE(min_stock_level, 0) AS FLOAT8) AS min_stock_level
     FROM products
     WHERE company_id = $1
+      AND deleted_at IS NULL
       AND ($2 = '' OR name ILIKE $2 OR hsn_code ILIKE $2)
       AND ($3::BOOL IS NULL OR is_active = $3)
     ORDER BY name

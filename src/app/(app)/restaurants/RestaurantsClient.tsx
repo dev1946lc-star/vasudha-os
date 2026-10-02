@@ -60,17 +60,29 @@ export default function RestaurantsClient({
   }
 
   const handleDelete = async (id: string, name: string) => {
-    if (!window.confirm(`Are you sure you want to delete ${name}?`)) {
+    if (
+      !window.confirm(
+        `Remove ${name} from your active list?\n\n` +
+          `Their invoices, collections and payments are kept for your records, ` +
+          `but they will no longer appear in lists or be selectable for new ` +
+          `deliveries. This can be undone.`,
+      )
+    ) {
       return
     }
 
-    const { error } = await supabase
-      .from('restaurants')
-      .delete()
-      .eq('id', id)
+    // delete_restaurant(), not DELETE. A hard delete destroys invoices and
+    // payments that reference the row, and has no deleted_at to fall back on --
+    // it just fails on the foreign key, which is what this used to do. The RPC
+    // soft-deletes and refuses while a balance is still outstanding.
+    const { error } = await supabase.rpc('delete_restaurant', {
+      p_restaurant_id: id,
+    })
 
     if (error) {
-      alert("Failed to delete restaurant: " + error.message)
+      // The RPC names the outstanding amount when that is the reason, so the
+      // message is already actionable -- show it rather than a generic failure.
+      alert(error.message)
     } else {
       router.refresh()
     }

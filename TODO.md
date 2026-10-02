@@ -236,6 +236,100 @@ rendering inherited Clerk's latency including its worst-case spikes.
   render already refetches, so there is no ISR to reason about. Either drop the
   export or drop `no-store`, deliberately.
 
+## Phase 8: Money was wrong (migrations 29 + 14b)
+
+Audited the built app against `archive_docs/` and found several defects that
+produced *plausible but incorrect* invoices. All silent — nothing errored.
+
+### Fixed
+
+**Returns were billed in full.** `generate_bulk_invoice` summed
+`collection_items.amount` (gross dispatched quantity); `return_quantity` only
+ever credited *stock*. An agent recording "delivered 20, returned 5" billed for
+20. Fixed by billing `quantity - return_quantity` and writing a `bill_items`
+snapshot per line. There was nowhere to store a net line before this, which is
+why it could not be fixed in place.
+
+**Prices came from the client.** `record_collection` wrote the submitted
+`unit_price` verbatim. Invoicing now reads `products.price` instead, so a tampered
+form cannot set the price.
+
+**No `due_date` existed.** `restaurants.payment_terms_days` was written by the
+form and never used. Aging computed `CURRENT_DATE - invoice_date` and labelled it
+`days_overdue`, so a bill dated today on 30-day terms reported as 0-15 days
+overdue. `invoices.due_date` added (NOT NULL, backfilled from terms); ageing
+re-based in `14b_aging_due_date.sql`; a `current` bucket now separates not-yet-due
+money instead of inflating 0-15.
+
+**GST was intra-state by assumption.** `igst` was the literal `0` and
+`cgst = sgst = amount × rate / 2 / 100`, with the source comment *"Assuming
+intra-state"*. No GSTIN was ever read. Added `gst_state_code()` and
+`is_inter_state_supply()`, which compare the two-digit state prefix of both
+GSTINs; inter-state takes the full rate as IGST, intra-state splits evenly.
+
+**The invoice page re-derived line items from `collection_items`.** It therefore
+showed gross amounts — reintroducing the returns bug in the document — and re-read
+live product names and prices, so renaming a product rewrote history. Now reads
+`bill_items`. The PDF and HTML gained tax rate, tax amount and total columns, plus
+the due date.
+
+**`reports/aging` read `detailed_aging_report`**, a per-restaurant rollup with no
+`invoice_id`, `invoice_number`, `days_overdue` or bucket column. It rendered
+blank dates and `NaN days` rather than failing. Now reads `invoice_aging`.
+
+### Test corrections
+
+Three existing tests asserted the buggy behaviour and had to change:
+- `invoice total is 2000 subtotal + 100 GST` expected `2100.00`, which billed the
+  returned cans. Now expects `1470.00` (1400 net + 70 GST) plus five new
+  assertions on the bill line.
+- The e2e aging checks expected a 5-day-old invoice in 0-15 and a 25-day-old one
+  in 16-30. Under correct due-date logic the 5-day one is **not yet due** and the
+  other is 1-15. Rewritten, with an explicit assertion that not-yet-due money
+  still counts toward the total.
+- `invoice_date`-based fixtures in `api-fixture.sql` now carry `due_date`; the
+  `NOT NULL` made that mandatory.
+
+### Migration ordering trap
+
+`14_aging_analysis.sql` now reads `due_date`, which `29` introduces — so it fails
+on a clean database with *column i.due_date does not exist*. Fixed by adding the
+column in a new `14b_aging_due_date.sql` and leaving `14` on `invoice_date` with a
+pointer to `14b`. `14b` also needs `DROP VIEW` before `CREATE`: Postgres refuses to
+`CREATE OR REPLACE` a view whose column *names* shift.
+
+### Still outstanding (not yet fixed)
+- **`credit_limit` is stored, displayed, never enforced** — a distributor can
+  deliver indefinitely into unbounded debt.
+- **Bulk billing cannot span restaurants** — `generate_bulk_invoice` raises
+  "All collections must belong to the same restaurant", so the spec's "200 bills
+  in 15 minutes" is one RPC per restaurant.
+- **Advance payments impossible** — `PaymentForm` disables submit when there is no
+  unpaid invoice, and there is no FIFO allocation to the oldest bill.
+- **`products/new` creates no `inventory` row**, so a brand-new product cannot be
+  dispatched (`RAISE EXCEPTION 'Cannot dispatch product — it has no stock record'`)
+  and is invisible on `/inventory` (INNER JOIN).
+- **Hard DELETE on restaurants/products** — no `deleted_at`, so financial history
+  is destroyed. Also breaks on FK for anything with collections.
+- **Managers cannot reach `/billing`**, while accountants can *verify* collections,
+  which the spec does not grant them.
+- **`collections.total_quantity` is never written** — permanently 0; report pages
+  re-sum nested items instead.
+- **Reports hardcode "kg"** for a water/dairy distributor.
+- **`ReceiptPDF` derefs `data.invoice.invoice_number`** while `payments.invoice_id`
+  is nullable — crashes on a loose payment.
+- **GSTR-3B missing entirely**; `reports/gst` hardcodes `"Rate": "5.00"` and
+  `"Place Of Supply": "State Code"`.
+- **`/payments/new?restaurant_id=` links are dead** — `NewPaymentPage` never reads
+  the param.
+
+### Platform mismatch, unresolved
+`archive_docs/MVP.md` specifies a **native Android app**: PIN auth, Android 8.0+,
+SQLite, 100% offline, APK size, battery drain. The build is a **Next.js web app**
+with Clerk email auth and Supabase. The 39 in-scope features were mapped against a
+web implementation; items 1 (PIN auth), the offline requirement (AC-01) and the
+performance targets are not achievable on this stack as written.
+
 Also on this machine, unrelated to the code: only **0.4 GB free of 15.3 GB**. A
 stale `next start -p 3100` from the smoke suite was holding RAM; it has been
 stopped. Several unrelated `omni-*` containers are also running.

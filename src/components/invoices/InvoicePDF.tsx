@@ -71,11 +71,15 @@ const styles = StyleSheet.create({
     borderBottomColor: '#f1f5f9',
     padding: 6,
   },
-  col1: { width: '40%' },
-  col2: { width: '15%', textAlign: 'right' },
-  col3: { width: '15%', textAlign: 'right' },
-  col4: { width: '15%', textAlign: 'right' },
-  col5: { width: '15%', textAlign: 'right' },
+  // Seven columns now carry the tax split, so the description yields width and
+  // the numeric columns share the rest.
+  col1: { width: '24%' },
+  col2: { width: '9%', textAlign: 'right' },
+  col3: { width: '8%', textAlign: 'right' },
+  col4: { width: '12%', textAlign: 'right' },
+  col5: { width: '13%', textAlign: 'right' },
+  col6: { width: '17%', textAlign: 'right' },
+  col7: { width: '13%', textAlign: 'right' },
   
   totals: {
     marginTop: 20,
@@ -113,9 +117,26 @@ const styles = StyleSheet.create({
   }
 });
 
+export type InvoiceLineItem = {
+  name: string;
+  hsn_code: string;
+  /** Net of returns: what the customer is actually charged for. */
+  quantity: number;
+  unit_price: number;
+  amount: number;
+  gst_rate: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  total_amount: number;
+  return_quantity: number;
+};
+
 export type InvoiceData = {
   invoice_number: string;
   invoice_date: string;
+  /** NOT NULL since migration 29; the ageing and overdue clock runs from here. */
+  due_date: string;
   subtotal: number;
   cgst: number;
   sgst: number;
@@ -132,13 +153,7 @@ export type InvoiceData = {
     address: string;
     phone: string;
   };
-  items: Array<{
-    name: string;
-    hsn_code: string;
-    quantity: number;
-    unit_price: number;
-    amount: number;
-  }>;
+  items: InvoiceLineItem[];
 };
 
 export const InvoicePDF = ({ data }: { data: InvoiceData }) => (
@@ -179,18 +194,41 @@ export const InvoicePDF = ({ data }: { data: InvoiceData }) => (
           <Text style={styles.col2}>HSN/SAC</Text>
           <Text style={styles.col3}>Qty</Text>
           <Text style={styles.col4}>Rate (₹)</Text>
-          <Text style={styles.col5}>Amount (₹)</Text>
+          <Text style={styles.col5}>Taxable (₹)</Text>
+          <Text style={styles.col6}>GST (₹)</Text>
+          <Text style={styles.col7}>Total (₹)</Text>
         </View>
-        
-        {data.items.map((item, i) => (
-          <View key={i} style={styles.tableRow}>
-            <Text style={styles.col1}>{item.name}</Text>
-            <Text style={styles.col2}>{item.hsn_code || '-'}</Text>
-            <Text style={styles.col3}>{item.quantity}</Text>
-            <Text style={styles.col4}>{item.unit_price.toFixed(2)}</Text>
-            <Text style={styles.col5}>{item.amount.toFixed(2)}</Text>
-          </View>
-        ))}
+
+        {data.items.map((item, i) => {
+          // One figure on the invoice, whichever way the split falls. Showing a
+          // zero-valued IGST line next to a zero-valued CGST line would imply the
+          // customer is exempt rather than that the supply is intra-state.
+          const tax = item.cgst + item.sgst + item.igst;
+          const taxLabel =
+            item.igst > 0
+              ? `IGST ${item.gst_rate}%`
+              : `CGST ${item.gst_rate / 2}% + SGST ${item.gst_rate / 2}%`;
+
+          return (
+            <View key={i} style={styles.tableRow}>
+              <Text style={styles.col1}>
+                {item.name}
+                {/* A returned line is charged at net quantity, so say so on the
+                    face of the invoice rather than leaving a discrepancy for the
+                    customer to query. */}
+                {item.return_quantity > 0
+                  ? ` (${item.return_quantity} returned, not charged)`
+                  : ''}
+              </Text>
+              <Text style={styles.col2}>{item.hsn_code || '-'}</Text>
+              <Text style={styles.col3}>{item.quantity}</Text>
+              <Text style={styles.col4}>{item.unit_price.toFixed(2)}</Text>
+              <Text style={styles.col5}>{item.amount.toFixed(2)}</Text>
+              <Text style={styles.col6}>{`${tax.toFixed(2)} (${taxLabel})`}</Text>
+              <Text style={styles.col7}>{item.total_amount.toFixed(2)}</Text>
+            </View>
+          );
+        })}
       </View>
 
       {/* Totals */}
@@ -200,19 +238,25 @@ export const InvoicePDF = ({ data }: { data: InvoiceData }) => (
             <Text>Subtotal</Text>
             <Text>₹{data.subtotal.toFixed(2)}</Text>
           </View>
-          <View style={styles.totalRow}>
-            <Text>CGST</Text>
-            <Text>₹{data.cgst.toFixed(2)}</Text>
-          </View>
-          <View style={styles.totalRow}>
-            <Text>SGST</Text>
-            <Text>₹{data.sgst.toFixed(2)}</Text>
-          </View>
-          {data.igst > 0 && (
+          {data.igst > 0 ? (
             <View style={styles.totalRow}>
               <Text>IGST</Text>
               <Text>₹{data.igst.toFixed(2)}</Text>
             </View>
+          ) : (
+            // Inter-state invoices carry IGST at the full rate and no CGST/SGST;
+            // intra-state ones are the reverse. Showing a zero for the absent one
+            // would misrepresent which regime the supply fell under.
+            <>
+              <View style={styles.totalRow}>
+                <Text>CGST</Text>
+                <Text>₹{data.cgst.toFixed(2)}</Text>
+              </View>
+              <View style={styles.totalRow}>
+                <Text>SGST</Text>
+                <Text>₹{data.sgst.toFixed(2)}</Text>
+              </View>
+            </>
           )}
           <View style={styles.grandTotal}>
             <Text>Total Amount</Text>
@@ -220,6 +264,15 @@ export const InvoicePDF = ({ data }: { data: InvoiceData }) => (
           </View>
         </View>
       </View>
+
+      {/* Payment terms. due_date drives ageing, so it belongs on the document a
+          customer holds, not only in the database. */}
+      {data.due_date ? (
+        <Text style={[styles.text, { marginTop: 12 }]}>
+          Payment due by {new Date(data.due_date).toLocaleDateString('en-IN')}. Please quote{' '}
+          {data.invoice_number} with any payment.
+        </Text>
+      ) : null}
 
       <View style={styles.footer}>
         <Text>This is a computer-generated invoice and does not require a physical signature.</Text>

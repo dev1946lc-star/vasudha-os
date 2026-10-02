@@ -60,17 +60,24 @@ export default function ProductsClient({
   }
 
   const handleDelete = async (id: string, name: string) => {
-    if (!window.confirm(`Are you sure you want to delete ${name}?`)) {
+    if (
+      !window.confirm(
+        `Remove ${name} from your active catalog?\n\n` +
+          `Past collections and invoices keep it, but it will no longer be ` +
+          `selectable for new deliveries. This can be undone.`,
+      )
+    ) {
       return
     }
 
-    const { error } = await supabase
-      .from('products')
-      .delete()
-      .eq('id', id)
+    // delete_product(), not DELETE. collection_items and bill_items reference
+    // the row, so a hard delete breaks invoice history; soft delete keeps it.
+    const { error } = await supabase.rpc('delete_product', {
+      p_product_id: id,
+    })
 
     if (error) {
-      alert("Failed to delete product: " + error.message)
+      alert(error.message)
     } else {
       router.refresh()
     }

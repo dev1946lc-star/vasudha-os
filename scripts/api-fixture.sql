@@ -51,6 +51,9 @@ VALUES
   ('b1000000-0000-4000-8000-000000000004', '11111111-1111-1111-1111-111111111111',
    'Discontinued Oil', 'Old stock', '15121990', 900, 5, FALSE, 0);
 
+-- The products trigger (migration 30) creates a zero-quantity row for every
+-- product on insert, so these top-ups must upsert rather than insert. The
+-- per-product quantities are what the low-stock and stock-take assertions read.
 INSERT INTO public.inventory (id, company_id, product_id, quantity, last_updated)
 VALUES
   ('c1000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
@@ -59,7 +62,9 @@ VALUES
    'b1000000-0000-4000-8000-000000000002', 7, NOW()),
   -- Below min_stock_level (20) -> low stock.
   ('c1000000-0000-4000-8000-000000000003', '11111111-1111-1111-1111-111111111111',
-   'b1000000-0000-4000-8000-000000000003', 5, NOW());
+   'b1000000-0000-4000-8000-000000000003', 5, NOW())
+ON CONFLICT (company_id, product_id) DO UPDATE
+  SET quantity = EXCLUDED.quantity, last_updated = EXCLUDED.last_updated;
 
 -- Collections across today and the recent past.
 INSERT INTO public.collections (id, company_id, restaurant_id, agent_id, collection_date,
@@ -91,26 +96,33 @@ VALUES
    'b1000000-0000-4000-8000-000000000001', 12, 0, 2350, 1380);
 
 -- Invoices spanning every aging bucket and every status.
-INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number, invoice_date,
+--
+-- due_date (migration 29) is NOT NULL, and aging is measured from it rather than
+-- from invoice_date. The restaurant has payment_terms_days = 15, so:
+--   invoice 1: dated 5 days ago  -> due in 10 days  -> 'current'
+--   invoice 2: dated 25 days ago -> due 10 days ago -> 10 days overdue -> '0-15'
+--   invoice 3: dated 70 days ago -> due 55 days ago -> '31-60'
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number, invoice_date, due_date,
                              subtotal, cgst, sgst, igst, total_amount, status)
 VALUES
   ('f1000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
    'a1000000-0000-4000-8000-000000000001',
-   'INV-' || to_char(CURRENT_DATE, 'YYYYMM') || '-0001', CURRENT_DATE - 5,
+   'INV-' || to_char(CURRENT_DATE, 'YYYYMM') || '-0001', CURRENT_DATE - 5, CURRENT_DATE + 10,
    2350, 58.75, 58.75, 0, 2468.50, 'unpaid'),
   ('f1000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
    'a1000000-0000-4000-8000-000000000001',
-   'INV-' || to_char(CURRENT_DATE - 10, 'YYYYMM') || '-0002', CURRENT_DATE - 25,
+   'INV-' || to_char(CURRENT_DATE - 10, 'YYYYMM') || '-0002', CURRENT_DATE - 25, CURRENT_DATE - 10,
    1725, 43.13, 43.13, 0, 1811.26, 'partial'),
   ('f1000000-0000-4000-8000-000000000003', '11111111-1111-1111-1111-111111111111',
    'a1000000-0000-4000-8000-000000000001',
-   'INV-' || to_char(CURRENT_DATE - 25, 'YYYYMM') || '-0003', CURRENT_DATE - 70,
+   'INV-' || to_char(CURRENT_DATE - 25, 'YYYYMM') || '-0003', CURRENT_DATE - 70, CURRENT_DATE - 55,
    1380, 34.50, 34.50, 0, 1449.00, 'unpaid');
 
--- Two payments, both partial or full on invoices that are already aged:
---   * invoice 2 (25 days) -> partial, leaving 811.26 in the 16-30 bucket
---   * invoice 3 (70 days) -> fully paid, so it drops out of outstanding entirely
--- Invoice 1 is deliberately left unpaid so it lands in the 0-15 bucket.
+-- Payments, partial or full, against invoices that are already aged:
+--   * invoice 2 -> partial, leaving 811.26 outstanding, 10 days overdue
+--   * invoice 3 -> covered by the first payment, drops out of outstanding
+-- Invoice 1 is deliberately left unpaid so it exercises the not-yet-due bucket,
+-- which the old invoice_date-based aging could not produce at all.
 INSERT INTO public.payments (id, company_id, restaurant_id, invoice_id, amount,
                              payment_mode, payment_date, reference_number)
 VALUES
@@ -144,12 +156,16 @@ VALUES ('a2000000-0000-4000-8000-000000000009', '22222222-2222-4222-8222-2222222
 INSERT INTO public.products (id, company_id, name, price, hsn_code, gst_rate, is_active, min_stock_level)
 VALUES ('b2000000-0000-4000-8000-000000000001', '22222222-2222-4222-8222-222222222222',
         'Beta Secret Oil', 9999, '15129999', 18, TRUE, 5);
+-- The products trigger (migration 30) already creates a zero row per product,
+-- so this only tops it up to 1.
 INSERT INTO public.inventory (company_id, product_id, quantity)
-VALUES ('22222222-2222-4222-8222-222222222222', 'b2000000-0000-4000-8000-000000000001', 1);
-INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number, invoice_date,
+VALUES ('22222222-2222-4222-8222-222222222222', 'b2000000-0000-4000-8000-000000000001', 1)
+ON CONFLICT (company_id, product_id) DO UPDATE SET quantity = 1;
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number, invoice_date, due_date,
                              subtotal, total_amount, status)
 VALUES ('f2000000-0000-4000-8000-000000000001', '22222222-2222-4222-8222-222222222222',
-        'a2000000-0000-4000-8000-000000000009', 'INV-BETA-0001', CURRENT_DATE - 100,
+        'a2000000-0000-4000-8000-000000000009', 'INV-BETA-0001',
+        CURRENT_DATE - 100, CURRENT_DATE - 85,
         9999, 11758.82, 'unpaid');
 INSERT INTO public.payments (id, company_id, restaurant_id, invoice_id, amount,
                              payment_mode, payment_date)

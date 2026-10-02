@@ -123,6 +123,8 @@ export type OutstandingRow = {
   restaurant_name: string
   phone?: string
   unpaid_invoice_count: number
+  /** Invoiced but not yet due. Distinct from the overdue buckets below. */
+  bucket_current: number
   bucket_0_15: number
   bucket_15_30: number
   bucket_30_60: number

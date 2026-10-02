@@ -269,11 +269,19 @@ async function runEndpointTests() {
   check('/api/inventory is tenant-scoped',
     Array.isArray(inv.json) && !inv.json.some((i) => i.product_name === 'Beta Secret Oil'),
     JSON.stringify(inv.json?.map?.((i) => i.product_name)))
-  check('/api/inventory returns all tenant A rows',
-    inv.json?.length === 3, `got ${inv.json?.length}`)
+  // 4, not 3: the products trigger (migration 30) gives every tenant-A product an
+  // inventory row, so the seeded three plus one product that had no stock row
+  // before. Any product with a stock record belongs here.
+  check('/api/inventory returns every tenant A product that has stock',
+    inv.json?.length === 4, `got ${inv.json?.length}`)
+  // Most urgent first: negative stock (a delivery that exceeded the count) then
+  // low stock. Ghee 5kg is the seeded low-stock line at 7 against a min of 20.
   check('/api/inventory orders low stock first',
     inv.json?.[0]?.product_name === 'Ghee 5kg',
-    `got ${inv.json?.[0]?.product_name}`)
+    `got ${inv.json?.[0]?.product_name} then ${inv.json?.[1]?.product_name}`)
+  check('/api/inventory returns every row for a product that exists',
+    inv.json?.every((i) => typeof i.product_name === 'string' && i.product_name.length > 0),
+    'each row names its product')
   check('/api/inventory flags low stock against min_stock_level',
     inv.json?.find((i) => i.product_name === 'Ghee 5kg')?.is_low_stock === true &&
     inv.json?.find((i) => i.product_name === 'Refined Oil 20L')?.is_low_stock === false)
@@ -355,17 +363,25 @@ async function runEndpointTests() {
         out.json.rows[i - 1].total_outstanding >= r.total_outstanding))
 
     if (hotel) {
-      // invoice 1: 5 days old, unpaid, 2468.50 -> 0-15 bucket
-      // invoice 2: 25 days old, partial, 811.26 remaining -> 16-30 bucket
-      check('aging puts a 5-day invoice in the 0-15 bucket',
-        Math.abs(hotel.bucket_0_15 - 2468.50) < 0.02, `got ${hotel.bucket_0_15}`)
-      check('aging puts a 25-day invoice in the 16-30 bucket',
-        Math.abs(hotel.bucket_15_30 - 811.26) < 0.02, `got ${hotel.bucket_15_30}`)
+      // Aging is measured from due_date, not invoice_date (migration 14b).
+      // Fixture: the hotel is on 15-day terms.
+      //   invoice 1: dated 5 days ago,  due in 10 days   -> NOT YET DUE, 2468.50
+      //   invoice 2: dated 25 days ago, due 10 days ago  -> 10 days overdue, 811.26 left
+      //   invoice 3: fully paid                          -> excluded entirely
+      check('money inside the payment term is not counted as overdue',
+        Math.abs(hotel.bucket_current - 2468.50) < 0.02, `got ${hotel.bucket_current}`)
+      check('a bill 10 days past due lands in the 1-15 bucket',
+        Math.abs(hotel.bucket_0_15 - 811.26) < 0.02, `got ${hotel.bucket_0_15}`)
+      check('nothing has aged past 15 days in this fixture',
+        hotel.bucket_15_30 === 0 && hotel.bucket_30_60 === 0 && hotel.bucket_60_plus === 0,
+        `15-30: ${hotel.bucket_15_30}, 30-60: ${hotel.bucket_30_60}, 60+: ${hotel.bucket_60_plus}`)
       check('paid invoices are excluded from aging',
         hotel.bucket_30_60 === 0 && hotel.bucket_60_plus === 0,
         `30-60: ${hotel.bucket_30_60}, 60+: ${hotel.bucket_60_plus}`)
-      check('outstanding total matches the buckets',
-        Math.abs(hotel.total_outstanding - (hotel.bucket_0_15 + hotel.bucket_15_30)) < 0.02,
+      // The not-yet-due bucket must still count toward the total owed, otherwise
+      // the header figure silently disagrees with the column beneath it.
+      check('outstanding total includes not-yet-due money',
+        Math.abs(hotel.total_outstanding - (hotel.bucket_current + hotel.bucket_0_15)) < 0.02,
         `total ${hotel.total_outstanding}`)
       check('outstanding counts unpaid invoices',
         hotel.unpaid_invoice_count === 2, `got ${hotel.unpaid_invoice_count}`)
