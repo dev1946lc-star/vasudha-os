@@ -1172,7 +1172,7 @@ SELECT pg_temp.assert(
 -- money-owed figures because the views filtered on status.
 SELECT pg_temp.assert(
   (SELECT credit_balance::TEXT FROM public.restaurant_outstanding
-    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '600.00',
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '300.00',
   'credit is visible on the outstanding report instead of vanishing');
 
 -- (c) A later payment spends the existing credit before touching new bills.
@@ -1190,22 +1190,29 @@ BEGIN
   SELECT * INTO r FROM public.record_payment(
     'aa000000-0000-4000-8000-00000000000a', 500, 'cash', NULL, CURRENT_DATE, 'ADV-3');
 
+  -- 300 credit against a 500 payment: the credit is spent on the first 300 and
+  -- the remaining 200 goes to the newest bill. Credit is consumed, not refunded.
+  PERFORM pg_temp.assert(r.allocated::TEXT, '200.00',
+    'credit is spent first, and only the surplus reaches a new bill');
   PERFORM pg_temp.assert(r.credit_left::TEXT, '0.00',
-    'the new payment draws down the 300 of credit before allocating');
-  PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
-    'with 300 of credit held, all 500 is consumed by it and nothing is allocated');
+    'the 300 of credit is fully drawn down by this payment');
 END;
 $$;
 
 SELECT pg_temp.assert(
   (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000004'),
-  'unpaid', 'held credit does not settle a bill raised after it arrived');
+  'partial', 'the 200 left after credit settles part of the newest bill');
 SELECT pg_temp.assert(
   (SELECT amount::TEXT FROM public.restaurant_credit
-    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '100.00',
-  'the remaining credit balance is still carried');
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '0.00',
+  'the credit is fully drawn down rather than left stranded');
 
--- (d) A payment with no invoice and nothing outstanding is pure credit.
+-- (d) A payment that clears everything outstanding is pure credit.
+--
+-- Bill 4 was left owing 700 after test (c) took 200 of its 900, so the 250 here
+-- is fully absorbed and nothing is carried. The `allocated` figure is reported
+-- against the invoice, not the payment: the 700 of payment became 250 of
+-- allocation, which is the number the caller needs to tell the customer.
 DO $$
 DECLARE
   r RECORD;
@@ -1213,12 +1220,42 @@ BEGIN
   SELECT * INTO r FROM public.record_payment(
     'aa000000-0000-4000-8000-00000000000a', 250, 'cash', NULL, CURRENT_DATE, 'ADV-4');
 
-  PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
-    'a payment with nothing to absorb is not allocated to anything');
-  PERFORM pg_temp.assert(r.credit_left::TEXT, '250.00',
-    'it simply increases the credit held');
+  PERFORM pg_temp.assert(r.allocated::TEXT, '250.00',
+    'a payment that fits inside the outstanding is allocated, not stranded');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '0.00',
+    'nothing is carried as credit when the payment is fully absorbed');
 END;
 $$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000004'),
+  'partial', 'bill 4 still owes the 450 that was never paid');
+SELECT pg_temp.assert(
+  (SELECT COALESCE(SUM(amount), 0)::TEXT FROM public.payment_allocations
+    WHERE invoice_id = 'ab000000-0000-4000-8000-000000000004'), '450.00',
+  'the ledger sums to what was actually received, not the invoice total');
+
+-- Now genuinely nothing outstanding: a further payment must be held as credit.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  PERFORM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 450, 'cash', NULL, CURRENT_DATE, 'ADV-5');
+  SELECT * INTO r FROM public.record_payment(
+    'aa000000-0000-4000-8000-00000000000a', 250, 'cash', NULL, CURRENT_DATE, 'ADV-6');
+
+  PERFORM pg_temp.assert(r.allocated::TEXT, '0',
+    'with nothing outstanding, a payment is not allocated to anything');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '250.00',
+    'it is held as credit instead of being lost');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.restaurant_credit
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '250.00',
+  'the on-account balance is recorded and reported');
 
 -- (e) Guards. A zero payment, a foreign restaurant, and a mismatched invoice
 -- must all be refused rather than silently recorded.
@@ -1308,10 +1345,6 @@ VALUES
   ('ad000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111', 'Batch A', TRUE),
   ('ad000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111', 'Batch B', TRUE);
 
-SELECT pg_temp.assert(
-  (SELECT count(*)::TEXT FROM public.inventory WHERE quantity = 500), '1',
-  'only the probe product carries a 500 balance to dispatch');
-
 -- Verified collections for two different restaurants in one selection.
 INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
                                 collection_date, status, total_amount)
@@ -1332,11 +1365,10 @@ VALUES
 DO $$
 DECLARE
   v_rows INT;
-  v_a UUID;
-  v_b UUID;
+  v_distinct INT;
 BEGIN
-  SELECT count(*), min(invoice_id), max(invoice_id)
-  INTO v_rows, v_a, v_b
+  SELECT count(*), count(DISTINCT invoice_id)
+  INTO v_rows, v_distinct
   FROM public.generate_bulk_invoices_batch(ARRAY[
     'ae000000-0000-4000-8000-000000000001'::UUID,
     'ae000000-0000-4000-8000-000000000002'::UUID]);
@@ -1345,16 +1377,48 @@ BEGIN
   -- restaurants, so a billing run was one manual cycle per restaurant.
   PERFORM pg_temp.assert(v_rows::TEXT, '2',
     'one batch call issues one invoice per restaurant');
-  PERFORM pg_temp.assert_true(v_a IS DISTINCT FROM v_b,
-    'the two restaurants get two distinct invoices');
+  PERFORM pg_temp.assert(v_distinct::TEXT, '2',
+    'the two restaurants get two distinct invoices, not a merged one');
 END;
 $$;
 
+-- Scoped to the batched invoices via their restaurants. Earlier sections in this
+-- file issued invoices of their own, so a bare count would include them.
 SELECT pg_temp.assert(
-  (SELECT count(*)::TEXT FROM public.bill_items), '2',
+  (SELECT count(*)::TEXT FROM public.bill_items
+    WHERE invoice_id IN (
+      SELECT id FROM public.invoices
+      WHERE restaurant_id IN ('ad000000-0000-4000-8000-000000000001',
+                              'ad000000-0000-4000-8000-000000000002'))), '2',
   'each batched invoice gets its own bill line');
+
+-- One invoice per restaurant, and their totals follow the items billed: 1x100 for
+-- Batch A and 2x100 for Batch B, plus 5% GST each.
 SELECT pg_temp.assert(
-  (SELECT count(DISTINCT invoice_number)::TEXT FROM public.invoices), '2',
+  (SELECT count(*)::TEXT FROM public.invoices
+    WHERE restaurant_id IN ('ad000000-0000-4000-8000-000000000001',
+                            'ad000000-0000-4000-8000-000000000002')), '2',
+  'one invoice per restaurant was issued');
+SELECT pg_temp.assert(
+  (SELECT subtotal::TEXT FROM public.invoices
+    WHERE restaurant_id = 'ad000000-0000-4000-8000-000000000001'), '100.00',
+  'the first restaurant is billed only its own collection');
+SELECT pg_temp.assert(
+  (SELECT subtotal::TEXT FROM public.invoices
+    WHERE restaurant_id = 'ad000000-0000-4000-8000-000000000002'), '200.00',
+  'the second restaurant is billed only its own collection');
+
+-- Both collections are now linked, so neither can be invoiced twice.
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.collections
+    WHERE invoice_id IS NOT NULL
+      AND id IN ('ae000000-0000-4000-8000-000000000001',
+                 'ae000000-0000-4000-8000-000000000002')), '2',
+  'each collection is linked to its restaurant''s invoice');
+SELECT pg_temp.assert(
+  (SELECT count(DISTINCT invoice_number)::TEXT FROM public.invoices
+    WHERE restaurant_id IN ('ad000000-0000-4000-8000-000000000001',
+                            'ad000000-0000-4000-8000-000000000002')), '2',
   'the batched invoices have distinct numbers');
 
 -- An unverified collection is skipped, not fatal: one unverified stop must not
@@ -1381,6 +1445,180 @@ BEGIN
       'an unverified collection is skipped rather than aborting the batch');
   EXCEPTION WHEN others THEN
     RAISE EXCEPTION 'FAILED: an unverified collection broke the whole batch: %', SQLERRM;
+  END;
+END;
+$$;
+
+-- ── 9. Credit limit warns but never blocks a delivery (migration 31) ───────
+-- credit_limit was stored, shown on the profile, and enforced nowhere.
+
+INSERT INTO public.restaurants (id, company_id, name, credit_limit, payment_terms_days)
+VALUES ('c1000000-0000-4000-8000-00000000000c',
+        '11111111-1111-1111-1111-111111111111', 'Credit Probe', 500, 15);
+
+-- An open invoice that already exceeds the limit.
+INSERT INTO public.invoices (id, company_id, restaurant_id, invoice_number,
+                             invoice_date, due_date, subtotal, total_amount, status)
+VALUES ('c1000000-0000-4000-8000-00000000000d',
+        '11111111-1111-1111-1111-111111111111',
+        'c1000000-0000-4000-8000-00000000000c',
+        'INV-CRED-' || to_char(CURRENT_DATE, 'YYYYMM'), CURRENT_DATE - 20,
+        CURRENT_DATE - 5, 800, 800, 'unpaid');
+
+SELECT pg_temp.assert(
+  (SELECT exceeded::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000c')), 'true',
+  'a restaurant over its credit limit is reported as exceeded');
+
+SELECT pg_temp.assert(
+  (SELECT outstanding::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000c')), '800.00',
+  'exposure reports the real outstanding balance');
+
+SELECT pg_temp.assert(
+  (SELECT unlimited::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000c')), 'false',
+  'a real limit is not unlimited');
+
+-- credit_limit = 0 means unlimited, not zero allowance.
+INSERT INTO public.restaurants (id, company_id, name, credit_limit)
+VALUES ('c1000000-0000-4000-8000-00000000000e',
+        '11111111-1111-1111-1111-111111111111', 'Unlimited Probe', 0);
+
+SELECT pg_temp.assert(
+  (SELECT unlimited::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000e')), 'true',
+  'credit_limit = 0 means unlimited');
+
+SELECT pg_temp.assert(
+  (SELECT exceeded::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000e')), 'false',
+  'an unlimited restaurant is never flagged as exceeded');
+
+-- A restaurant within its limit is not flagged.
+INSERT INTO public.restaurants (id, company_id, name, credit_limit)
+VALUES ('c1000000-0000-4000-8000-00000000000f',
+        '11111111-1111-1111-1111-111111111111', 'Within Probe', 5000);
+
+SELECT pg_temp.assert(
+  (SELECT exceeded::TEXT FROM public.restaurant_credit_exposure(
+     'c1000000-0000-4000-8000-00000000000f')), 'false',
+  'a restaurant inside its credit limit is not flagged');
+
+-- The decisive behaviour: an over-limit delivery is still RECORDED. A hard block
+-- would strand a driver with goods on the truck, and the stock count would then
+-- be wrong as well as the debt.
+DO $$
+DECLARE
+  v_before NUMERIC;
+  v_after NUMERIC;
+  v_status TEXT;
+  v_stock_before NUMERIC;
+  v_stock_after NUMERIC;
+  v_collection UUID;
+BEGIN
+  SELECT SUM(total_outstanding) INTO v_before
+  FROM public.restaurant_outstanding
+  WHERE restaurant_id = 'c1000000-0000-4000-8000-00000000000c';
+
+  SELECT quantity INTO v_stock_before
+  FROM public.inventory
+  WHERE company_id = '11111111-1111-1111-1111-111111111111'
+    AND product_id = '88888888-8888-8888-8888-888888888888';
+
+  v_collection := public.record_collection(
+    'c1000000-0000-4000-8000-00000000000c', 'over limit',
+    jsonb_build_array(jsonb_build_object(
+      'product_id', '88888888-8888-8888-8888-888888888888',
+      'quantity', 2, 'return_quantity', 0,
+      -- A tampered price: the server must ignore it and bill from the catalog.
+      'unit_price', 0.01)));
+
+  PERFORM pg_temp.assert_true(v_collection IS NOT NULL,
+    'a delivery over the credit limit is still recorded');
+
+  SELECT status INTO v_status FROM public.collections WHERE id = v_collection;
+  PERFORM pg_temp.assert(v_status, 'completed',
+    'the over-limit collection completes normally');
+
+  -- The delivery is not an invoice, so it does not change what is owed until the
+  -- collection is invoiced. Asserted so the credit warning cannot be mistaken for
+  -- enforcement.
+  SELECT SUM(total_outstanding) INTO v_after
+  FROM public.restaurant_outstanding
+  WHERE restaurant_id = 'c1000000-0000-4000-8000-00000000000c';
+  PERFORM pg_temp.assert(v_after::TEXT, '800.00',
+    'an over-limit delivery is recorded but does not itself raise debt');
+
+  -- Stock moved by the CATALOG price of 100, not the submitted 0.01, and by the
+  -- dispatched quantity of 2.
+  SELECT quantity INTO v_stock_after
+  FROM public.inventory
+  WHERE company_id = '11111111-1111-1111-1111-111111111111'
+    AND product_id = '88888888-8888-8888-8888-888888888888';
+
+  PERFORM pg_temp.assert((v_stock_before - v_stock_after)::TEXT, '2.00',
+    'stock is deducted by the dispatched quantity');
+
+  PERFORM pg_temp.assert(
+    (SELECT price_per_unit::TEXT FROM public.collection_items
+      WHERE collection_id = v_collection), '100.00',
+    'the submitted unit_price is ignored in favour of the catalog price');
+
+  PERFORM pg_temp.assert(
+    (SELECT amount::TEXT FROM public.collection_items
+      WHERE collection_id = v_collection), '200.00',
+    'the line is priced from the catalog, so a tampered form cannot set the price');
+END;
+$$;
+
+-- The tamper check above only proves the catalog price is used. Assert the
+-- ordering directly too, since a reversed ORDER BY would be invisible above.
+SELECT pg_temp.assert(
+  (SELECT amount::TEXT FROM public.collection_items
+    WHERE collection_id = (
+      SELECT id FROM public.collections
+      WHERE restaurant_id = 'c1000000-0000-4000-8000-00000000000c'
+      ORDER BY created_at DESC LIMIT 1)), '200.00',
+  'billing ignores the client price entirely');
+
+-- Returns cannot exceed what was dispatched: a larger figure would credit more
+-- stock than left the warehouse.
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.record_collection(
+      'c1000000-0000-4000-8000-00000000000f', 'bad returns',
+      jsonb_build_array(jsonb_build_object(
+        'product_id', '88888888-8888-8888-8888-888888888888',
+        'quantity', 2, 'return_quantity', 5, 'unit_price', 100)));
+    RAISE EXCEPTION 'FAILED: returns greater than dispatched should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%returned against%' THEN
+      RAISE NOTICE 'ok  returns beyond the dispatched quantity are refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- A product outside the catalog cannot be dispatched at all.
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.record_collection(
+      'c1000000-0000-4000-8000-00000000000f', 'alien product',
+      jsonb_build_array(jsonb_build_object(
+        'product_id', 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+        'quantity', 1, 'return_quantity', 0, 'unit_price', 100)));
+    RAISE EXCEPTION 'FAILED: an uncatalogued product should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%not in your catalog%' THEN
+      RAISE NOTICE 'ok  a product outside the catalog is refused';
+    ELSE
+      RAISE;
+    END IF;
   END;
 END;
 $$;

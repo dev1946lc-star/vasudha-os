@@ -104,9 +104,22 @@ export type ReceiptData = {
     gst_number: string | null;
     logo_url: string | null;
   };
+  /**
+   * Nullable. `payments.invoice_id` became optional in migration 31 so a round
+   * number can be taken against several bills, or before the period is billed.
+   * This was declared non-nullable and dereferenced unconditionally, which threw
+   * on exactly those payments -- the ones the change was made to enable.
+   */
   invoice: {
     invoice_number: string;
-  };
+  } | null;
+  /** Bills this payment actually settled, oldest first. Empty for a pure advance. */
+  allocations?: Array<{
+    invoice_number: string;
+    amount: number;
+  }>;
+  /** Surplus held on the restaurant's account after allocation. */
+  creditLeft?: number;
 };
 
 export const ReceiptPDF = ({ data }: { data: ReceiptData }) => (
@@ -155,10 +168,40 @@ export const ReceiptPDF = ({ data }: { data: ReceiptData }) => (
         </View>
       )}
 
-      <View style={styles.row}>
-        <Text style={styles.label}>Applied to Invoice</Text>
-        <Text style={styles.value}>{data.invoice.invoice_number}</Text>
-      </View>
+      {/* An advance has no single invoice, so the receipt says what the money
+          was actually for rather than dereferencing a null invoice. */}
+      {data.invoice ? (
+        <View style={styles.row}>
+          <Text style={styles.label}>Applied to Invoice</Text>
+          <Text style={styles.value}>{data.invoice.invoice_number}</Text>
+        </View>
+      ) : (
+        <View style={styles.row}>
+          <Text style={styles.label}>Applied to</Text>
+          <Text style={styles.value}>Payment on account (advance)</Text>
+        </View>
+      )}
+
+      {/* When one payment settles several bills, the receipt must show the split:
+          the customer needs to know which bills were closed. */}
+      {data.allocations && data.allocations.length > 0 && (
+        <View style={{ marginTop: 6, marginBottom: 4 }}>
+          <Text style={styles.label}>Bills Settled</Text>
+          {data.allocations.map((a) => (
+            <View key={a.invoice_number} style={styles.row}>
+              <Text style={styles.value}>{a.invoice_number}</Text>
+              <Text style={styles.value}>₹{a.amount.toFixed(2)}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+
+      {data.creditLeft !== undefined && data.creditLeft > 0 && (
+        <View style={styles.row}>
+          <Text style={styles.label}>Credit Held On Account</Text>
+          <Text style={styles.value}>₹{data.creditLeft.toFixed(2)}</Text>
+        </View>
+      )}
 
       <View style={styles.row}>
         <Text style={styles.label}>Receipt ID</Text>

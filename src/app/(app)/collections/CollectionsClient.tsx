@@ -1,9 +1,9 @@
 "use client"
 
-import { useState, useMemo, useCallback } from "react"
+import { useState, useMemo, useCallback, useEffect } from "react"
 import { supabase } from "@/lib/supabase"
 import Link from "next/link"
-import { Plus, MapPin, Truck, CheckCircle2, Clock, ShieldCheck } from "lucide-react"
+import { Plus, MapPin, Truck, CheckCircle2, Clock, ShieldCheck, AlertTriangle } from "lucide-react"
 import { useAppStore } from "@/store"
 
 type Restaurant = {
@@ -12,6 +12,25 @@ type Restaurant = {
   address: string | null
   contact_person: string | null
   phone: string | null
+}
+
+/**
+ * Credit position for a restaurant on the day's route.
+ *
+ * credit_limit was stored, displayed on the profile, and enforced nowhere, so a
+ * distributor could deliver into unbounded debt and only find out on a statement.
+ * `record_collection` now warns (migration 31) -- deliberately not blocking,
+ * since a delivery that physically happened must still be recorded -- which means
+ * the warning has to reach the person who can act on it: the agent, before the
+ * next stop.
+ */
+type CreditStatus = {
+  restaurant_id: string
+  outstanding: number
+  credit_limit: number
+  headroom: number
+  exceeded: boolean
+  unlimited: boolean
 }
 
 type Collection = {
@@ -24,14 +43,76 @@ type Collection = {
 interface Props {
   initialRestaurants: Restaurant[]
   initialCollections: Collection[]
+  /** Per-restaurant credit position. Empty until the lookup resolves. */
+  initialCredit: CreditStatus[]
 }
 
-export default function CollectionsClient({ initialRestaurants, initialCollections }: Props) {
+export default function CollectionsClient({ initialRestaurants, initialCollections, initialCredit }: Props) {
   const user = useAppStore((state) => state.user)
   const isManagerOrOwner = user?.role === 'manager' || user?.role === 'owner' || user?.role === 'accountant'
 
   const [collections, setCollections] = useState<Collection[]>(initialCollections)
   const [verifying, setVerifying] = useState<string | null>(null)
+
+  // Fetched client-side rather than passed in: restaurant_credit_exposure is one
+  // row per restaurant, so a single RPC over the day's route beats N page-level
+  // queries, and the route list is already client-rendered.
+  const [credit, setCredit] = useState<CreditStatus[]>(initialCredit)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadCredit() {
+      const ids = initialRestaurants.map(r => r.id)
+      if (ids.length === 0) return
+
+      // restaurant_credit_exposure takes one id, so the day's stops are read in
+      // parallel. Bounded by the route size (typically well under 200).
+      const results = await Promise.all(
+        ids.map(async (id): Promise<CreditStatus | null> => {
+          try {
+            const { data, error } = await supabase.rpc('restaurant_credit_exposure', {
+              p_restaurant_id: id,
+            })
+            if (error || !data || data.length === 0) return null
+            const row = data[0]
+            return {
+              restaurant_id: id,
+              outstanding: Number(row.outstanding),
+              credit_limit: Number(row.credit_limit),
+              headroom: Number(row.headroom),
+              exceeded: Boolean(row.exceeded),
+              unlimited: Boolean(row.unlimited),
+            }
+          } catch {
+            // One failing lookup must not blank the whole route; the badge for that
+            // stop simply does not appear.
+            return null
+          }
+        })
+      )
+
+      if (!cancelled) {
+        setCredit(results.filter((r): r is CreditStatus => r !== null))
+      }
+    }
+
+    loadCredit()
+
+    return () => { cancelled = true }
+  }, [initialRestaurants])
+
+  const creditByRestaurant = useMemo(
+    () => new Map(credit.map(c => [c.restaurant_id, c])),
+    [credit]
+  )
+
+  // How many stops are already over their limit. Counted on the route rather than
+  // per stop, so the driver sees the scale of the problem before starting the day.
+  const overLimitStops = useMemo(
+    () => initialRestaurants.filter(r => creditByRestaurant.get(r.id)?.exceeded).length,
+    [initialRestaurants, creditByRestaurant]
+  )
 
   const handleVerify = useCallback(async (collectionId: string) => {
     if (!window.confirm("Mark this collection as verified? It will be locked from further edits.")) return
@@ -84,6 +165,21 @@ export default function CollectionsClient({ initialRestaurants, initialCollectio
             style={{ width: `${progressPercent}%` }}
           />
         </div>
+
+        {/* Counted across the route so the driver knows the scale before starting,
+            rather than discovering one over-limit kitchen at a time. */}
+        {overLimitStops > 0 && (
+          <div className="mt-4 flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+            <p className="text-sm text-amber-800">
+              <strong className="font-semibold">
+                {overLimitStops} stop{overLimitStops === 1 ? '' : 's'} on today&apos;s route
+              </strong>{' '}
+              {overLimitStops === 1 ? 'is' : 'are'} over the agreed credit limit. Deliveries are
+              still recorded — check before you leave.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Stop List */}
@@ -98,19 +194,48 @@ export default function CollectionsClient({ initialRestaurants, initialCollectio
             const isCompleted = stop.status === 'completed'
             const isVerified = stop.status === 'verified'
             const isVerifyingThis = verifying === stop.collection_id
-            
+            const credit = creditByRestaurant.get(stop.id)
+
             return (
               <div
                 key={stop.id}
                 className={`bg-white rounded-xl border shadow-sm p-4 sm:p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 transition-all ${
-                  isVerified ? 'border-green-300 bg-green-50/30' : 'border-slate-200 hover:border-blue-300'
+                  credit?.exceeded
+                    ? 'border-amber-300 bg-amber-50/40'
+                    : isVerified
+                      ? 'border-green-300 bg-green-50/30'
+                      : 'border-slate-200 hover:border-blue-300'
                 }`}
               >
                 <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <h3 className={`text-lg font-bold ${(isCompleted || isVerified) ? 'text-slate-500 line-through' : 'text-slate-900'}`}>
                       {stop.name}
                     </h3>
+                    {/* The warning the database emits on dispatch, surfaced before
+                        the driver gets to the door rather than on a statement weeks
+                        later. */}
+                    {credit?.exceeded && (
+                      <span
+                        title={`₹${credit.outstanding.toFixed(2)} outstanding against a ₹${credit.credit_limit.toFixed(2)} limit`}
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800 border border-amber-200"
+                      >
+                        <AlertTriangle className="h-3 w-3" /> Over credit limit
+                      </span>
+                    )}
+                    {!credit?.exceeded && credit && !credit.unlimited && (
+                      <span
+                        title={`₹${credit.headroom.toFixed(2)} of headroom remaining`}
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600"
+                      >
+                        ₹{credit.headroom.toFixed(0)} headroom
+                      </span>
+                    )}
+                    {credit?.unlimited && (
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
+                        No credit limit
+                      </span>
+                    )}
                     {isVerified ? (
                       <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 border border-emerald-200">
                         <ShieldCheck className="h-3 w-3" /> Verified

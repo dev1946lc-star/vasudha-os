@@ -54,6 +54,10 @@ export default async function DailyCollectionsPage() {
       <CollectionsClient
         initialRestaurants={restaurantsData}
         initialCollections={collectionsData}
+        // Credit positions load client-side via restaurant_credit_exposure, one row
+        // per stop. Seeding with [] means the badges appear as they resolve rather
+        // than blocking the route render on N sequential RPCs.
+        initialCredit={[]}
       />
     </div>
   )

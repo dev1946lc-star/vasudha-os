@@ -6,7 +6,7 @@ import { paymentSchema, PaymentFormValues } from "@/lib/validations/payment"
 import { useState, useEffect, useActionState } from "react"
 import { useRouter } from "next/navigation"
 import { supabase } from "@/lib/supabase"
-import { CreditCard, IndianRupee } from "lucide-react"
+import { CreditCard, IndianRupee, CheckCircle2 } from "lucide-react"
 import { recordPaymentAction, ActionState } from "@/app/actions/payments"
 
 type RestaurantDropdown = {
@@ -31,9 +31,10 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
   const router = useRouter()
   const [invoices, setInvoices] = useState<InvoiceDropdown[]>([])
   const [isLoadingInvoices, setIsLoadingInvoices] = useState(false)
-  
+  const [creditBalance, setCreditBalance] = useState<number | null>(null)
+
   const [state, formAction, isPending] = useActionState<ActionState, FormData>(recordPaymentAction, {})
-  
+
   const {
     register,
     watch,
@@ -63,6 +64,7 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
 
       if (!selectedRestaurantId) {
         setInvoices([])
+        setCreditBalance(null)
         return
       }
 
@@ -78,12 +80,25 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
         setInvoices(data)
       }
       setIsLoadingInvoices(false)
+
+      // Money already paid and not yet matched to an invoice. Shown so an
+      // accountant can see the restaurant is square before taking another payment.
+      const { data: creditRows } = await supabase
+        .from('restaurant_credit')
+        .select('amount')
+        .eq('restaurant_id', selectedRestaurantId)
+        .limit(1)
+
+      const held = creditRows?.[0]?.amount
+      setCreditBalance(typeof held === 'number' ? held : 0)
     }
 
     fetchInvoices()
   }, [selectedRestaurantId, setValue])
 
-  // Auto-fill amount when invoice is selected
+  // Pre-fill the amount from the chosen invoice so the common case stays one
+  // click. The user can still type a different figure, and must be able to: a
+  // partial payment is normal.
   useEffect(() => {
     if (selectedInvoiceId) {
       const invoice = invoices.find(inv => inv.id === selectedInvoiceId)
@@ -93,14 +108,70 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
     }
   }, [selectedInvoiceId, invoices, setValue])
 
-  // Redirect on success
+  // Show the outcome before navigating. With FIFO allocation the money may have
+  // settled several bills and left a credit, and silently redirecting to the
+  // list hides that -- which is the information the user needs to give the
+  // customer.
+  const [showOutcome, setShowOutcome] = useState(false)
   useEffect(() => {
     if (state.success) {
-      router.push('/payments')
+      setShowOutcome(true)
     }
-  }, [state.success, router])
+  }, [state.success])
 
   const needsReference = selectedMode === 'upi' || selectedMode === 'bank_transfer' || selectedMode === 'cheque'
+
+  if (showOutcome && state.success) {
+    const allocated = state.allocated ?? 0
+    const credit = state.creditLeft ?? 0
+    const partial = credit > 0 || (state.invoicesHit ?? 0) > 1
+
+    return (
+      <div className="max-w-2xl mx-auto bg-white p-8 rounded-xl border border-slate-200 shadow-sm space-y-5">
+        <div className="flex items-start gap-3">
+          <CheckCircle2 className="h-6 w-6 text-emerald-600 shrink-0 mt-0.5" />
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Payment recorded</h2>
+            <p className="text-sm text-slate-600 mt-1">
+              {partial ? (
+                <>
+                  ₹{allocated.toFixed(2)} was applied to{' '}
+                  {state.invoicesHit === 1 ? 'the oldest open bill' : `the ${state.invoicesHit} oldest open bills`}
+                  {credit > 0 && (
+                    <>
+                      . The remaining <strong className="text-slate-900">₹{credit.toFixed(2)}</strong> is
+                      held as credit on this account and will be applied to their next bill
+                      automatically.
+                    </>
+                  )}
+                  .
+                </>
+              ) : (
+                <>The full amount was applied to the selected invoice.</>
+              )}
+            </p>
+          </div>
+        </div>
+
+        <div className="pt-4 border-t border-slate-100 flex gap-3">
+          <button
+            type="button"
+            onClick={() => router.push('/payments')}
+            className="flex-1 py-2.5 px-4 border border-slate-300 rounded-md shadow-sm text-sm font-medium text-slate-700 bg-white hover:bg-slate-50"
+          >
+            All Payments
+          </button>
+          <button
+            type="button"
+            onClick={() => router.push('/outstanding')}
+            className="flex-1 py-2.5 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700"
+          >
+            View Outstanding
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <form action={formAction} className="space-y-6 bg-white p-6 rounded-xl border border-slate-200 shadow-sm max-w-2xl mx-auto">
@@ -125,15 +196,22 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
           {errors.restaurant_id && <p className="mt-1 text-sm text-red-600">{errors.restaurant_id.message}</p>}
         </div>
 
+        {/* A restaurant with nothing outstanding is now a normal state, not a
+            dead end: the payment is an advance. The previous version disabled
+            submit entirely, which made advance payments unrepresentable. */}
         <div>
-          <label className="block text-sm font-medium text-slate-700">Link to Invoice</label>
+          <label className="block text-sm font-medium text-slate-700">
+            Apply Against <span className="text-slate-400 font-normal">(optional)</span>
+          </label>
           <select
             {...register("invoice_id")}
             disabled={!selectedRestaurantId || isLoadingInvoices}
             className="mt-1 block w-full pl-3 pr-10 py-2.5 text-base border-slate-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md border disabled:bg-slate-50 disabled:text-slate-500"
           >
-            <option value="" disabled>
-              {isLoadingInvoices ? "Loading invoices..." : "Select an unpaid invoice..."}
+            <option value="">
+              {isLoadingInvoices
+                ? "Loading invoices..."
+                : "Auto — apply to oldest unpaid bills first"}
             </option>
             {invoices.map((inv) => (
               <option key={inv.id} value={inv.id}>
@@ -141,9 +219,23 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
               </option>
             ))}
           </select>
+          <p className="mt-1 text-xs text-slate-500">
+            Leave as auto to settle the oldest open bills first, oldest due date at the top.
+            Anything left over is held as credit.
+          </p>
           {errors.invoice_id && <p className="mt-1 text-sm text-red-600">{errors.invoice_id.message}</p>}
+
           {!isLoadingInvoices && selectedRestaurantId && invoices.length === 0 && (
-            <p className="mt-1 text-xs text-emerald-600 font-medium">This restaurant has no unpaid invoices!</p>
+            <p className="mt-1 text-xs text-emerald-600 font-medium">
+              No unpaid invoices — this will be recorded as an advance on account.
+            </p>
+          )}
+
+          {creditBalance !== null && creditBalance > 0 && (
+            <p className="mt-2 text-xs text-blue-700 font-medium">
+              This restaurant already holds ₹{creditBalance.toFixed(2)} in credit. That is applied
+              first, before any of this payment reaches an invoice.
+            </p>
           )}
         </div>
       </div>
@@ -212,9 +304,11 @@ export function PaymentForm({ restaurants, defaultRestaurantId, defaultInvoiceId
         >
           Cancel
         </button>
+        {/* Only pending disables the button now. Gating on invoices.length === 0
+            is what made advance payments impossible. */}
         <button
           type="submit"
-          disabled={isPending || invoices.length === 0}
+          disabled={isPending}
           className="flex-1 py-2.5 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 flex items-center justify-center gap-2"
         >
           <CreditCard className="h-4 w-4" />

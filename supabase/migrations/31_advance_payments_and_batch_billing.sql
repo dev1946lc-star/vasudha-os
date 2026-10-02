@@ -125,6 +125,10 @@ DECLARE
   v_allocated NUMERIC := 0;
   v_hits INT := 0;
   v_credit NUMERIC := 0;
+  -- How much of the held credit this payment consumed. Tracked separately from
+  -- v_credit so the final balance is (held - consumed + leftover) rather than
+  -- double-counting the credit the payment just spent.
+  v_credit_used NUMERIC := 0;
   v_invoice RECORD;
   v_applied NUMERIC;
 BEGIN
@@ -168,23 +172,19 @@ BEGIN
   ) RETURNING id INTO v_payment_id;
 
   -- Spend any credit already on the account first. This is what makes a second
-  -- advance payment settle an earlier one's obligations instead of stacking.
+  -- advance payment settle an earlier one's obligations instead of stacking, and
+  -- what stops the same money being counted twice against the same bills.
   SELECT amount INTO v_credit
   FROM public.restaurant_credit
   WHERE company_id = v_company_id AND restaurant_id = p_restaurant_id
   FOR UPDATE;
 
+  -- Three separate quantities, because conflating them is what produced a
+  -- negative credit balance: the credit HELD, how much of it this payment
+  -- CONSUMES, and what is left of the payment to ALLOCATE.
   v_credit := COALESCE(v_credit, 0);
-
-  IF v_credit > 0 AND v_remaining > 0 THEN
-    IF v_credit >= v_remaining THEN
-      v_remaining := v_remaining - v_credit;
-      v_credit := 0;
-    ELSE
-      v_credit := v_credit - v_remaining;
-      v_remaining := 0;
-    END IF;
-  END IF;
+  v_credit_used := LEAST(v_credit, v_remaining);
+  v_remaining := v_remaining - v_credit_used;
 
   -- Then walk open invoices oldest-first. due_date leads because that is what the
   -- customer sees on the statement; invoice_date breaks ties so the order is
@@ -221,7 +221,10 @@ BEGIN
   -- Whatever is left is credit the restaurant holds. Recording it is the whole
   -- point: the previous behaviour let a surplus vanish from the money-owed
   -- figures because the views filtered on status.
-  v_credit := v_credit + v_remaining;
+  --
+  -- The credit this payment already consumed is subtracted, otherwise the same
+  -- rupees would be counted once as consumed and again as held.
+  v_credit := v_credit - v_credit_used + v_remaining;
 
   INSERT INTO public.restaurant_credit (company_id, restaurant_id, amount, updated_at)
   VALUES (v_company_id, p_restaurant_id, v_credit, NOW())
@@ -529,5 +532,162 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 COMMENT ON FUNCTION public.generate_bulk_invoices_batch(UUID[]) IS
   'Issues one invoice per distinct restaurant from verified collections. Returns '
   'a row per invoice issued; skipped collections produce no row.';
+
+-- ── 5. Credit limit on dispatch: warn, never block ────────────────────────
+--
+-- credit_limit was written by the restaurant form, displayed on the profile, and
+-- read by the Rust API -- and checked by nothing. A distributor could deliver
+-- indefinitely into unbounded debt and only find out on a statement.
+--
+-- Per the spec this warns rather than refuses. A hard block in the field strands
+-- a driver at a kitchen with goods on the truck, and the delivery still happened,
+-- so refusing to record it corrupts the stock count as well as the debt. The
+-- warning is the actionable part; the collection is recorded either way.
+--
+-- The exposure is exposed as a function so the collections list can show it
+-- alongside the day's stops rather than only in a server log.
+
+CREATE OR REPLACE FUNCTION public.restaurant_credit_exposure(p_restaurant_id UUID)
+RETURNS TABLE (
+  outstanding NUMERIC,
+  credit_limit NUMERIC,
+  headroom NUMERIC,
+  exceeded    BOOLEAN,
+  unlimited   BOOLEAN
+) AS $$
+  SELECT
+    COALESCE(so.total_outstanding, 0),
+    COALESCE(r.credit_limit, 0),
+    COALESCE(r.credit_limit, 0) - COALESCE(so.total_outstanding, 0),
+    COALESCE(r.credit_limit, 0) > 0
+      AND COALESCE(so.total_outstanding, 0) > COALESCE(r.credit_limit, 0),
+    COALESCE(r.credit_limit, 0) = 0
+  FROM public.restaurants r
+  LEFT JOIN public.restaurant_outstanding so
+    ON so.restaurant_id = r.id
+  WHERE r.id = p_restaurant_id;
+$$ LANGUAGE SQL STABLE SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.restaurant_credit_exposure(UUID) IS
+  'Outstanding balance against the credit limit. unlimited = TRUE when credit_limit is 0.';
+
+-- Re-pointed rather than wrapped: the collection must still be recorded, so the
+-- check emits a warning and returns, exactly like the negative-stock case.
+CREATE OR REPLACE FUNCTION public.record_collection(
+  p_restaurant_id UUID,
+  p_notes TEXT,
+  p_items JSONB
+) RETURNS UUID AS $$
+DECLARE
+  v_company_id UUID;
+  v_agent_id TEXT;
+  v_collection_id UUID;
+  v_total_amount DECIMAL(12,2) := 0;
+  v_item JSONB;
+  v_product_id UUID;
+  v_quantity DECIMAL;
+  v_return_quantity DECIMAL;
+  v_unit_price DECIMAL;
+  v_amount DECIMAL(12,2);
+  v_credit RECORD;
+  v_projected NUMERIC;
+  v_new_outstanding NUMERIC;
+BEGIN
+  PERFORM public.assert_role(ARRAY['owner', 'manager', 'agent']);
+
+  v_company_id := (NULLIF(public.jwt_claim('app_metadata') ->> 'company_id', ''))::UUID;
+  v_agent_id := public.current_user_id();
+
+  IF v_company_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized. Missing company_id in token.';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.restaurants
+    WHERE id = p_restaurant_id AND company_id = v_company_id AND deleted_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Restaurant % does not belong to your company.', p_restaurant_id;
+  END IF;
+
+  -- Price the delivery before recording it, so the credit check can project the
+  -- balance this collection would create. Reading products.price rather than the
+  -- client's unit_price is deliberate: a tampered form must not shrink its own
+  -- exposure.
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+  LOOP
+    v_amount := COALESCE((v_item->>'quantity')::DECIMAL, 0)
+             * COALESCE((SELECT price FROM public.products
+                          WHERE id = (v_item->>'product_id')::UUID
+                            AND company_id = v_company_id), 0);
+    v_total_amount := v_total_amount + v_amount;
+  END LOOP;
+
+  -- Warn, do not block. See the note above.
+  SELECT * INTO v_credit
+  FROM public.restaurant_credit_exposure(p_restaurant_id);
+
+  IF v_credit.exceeded THEN
+    RAISE WARNING
+      'Credit limit exceeded for this restaurant: % outstanding against a limit of %. '
+      'This delivery takes it to %.', v_credit.outstanding, v_credit.credit_limit,
+      v_credit.outstanding + v_total_amount;
+  END IF;
+
+  -- Insert the header as 'draft' first.
+  --
+  -- This ordering is load-bearing. process_inventory_on_collection_completion()
+  -- is an AFTER trigger on collections that reads the collection's
+  -- collection_items. If the header were inserted directly as 'completed', the
+  -- trigger would fire before any line items existed, iterate an empty set, and
+  -- silently deduct nothing - stock would never move on dispatch. Inserting as
+  -- 'draft', adding the items, then transitioning to 'completed' makes the
+  -- trigger's UPDATE branch fire once the items are in place.
+  INSERT INTO public.collections (
+    company_id, restaurant_id, agent_id, collection_date, status, notes, total_amount
+  ) VALUES (
+    v_company_id, p_restaurant_id, v_agent_id, CURRENT_DATE, 'draft', p_notes, 0
+  ) RETURNING id INTO v_collection_id;
+
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+  LOOP
+    v_product_id := (v_item->>'product_id')::UUID;
+    v_quantity := COALESCE((v_item->>'quantity')::DECIMAL, 0);
+    v_return_quantity := COALESCE((v_item->>'return_quantity')::DECIMAL, 0);
+    -- Server-side price. The client value is ignored: see the note above.
+    v_unit_price := COALESCE((SELECT price FROM public.products
+                               WHERE id = v_product_id AND company_id = v_company_id), 0);
+
+    IF v_unit_price = 0 THEN
+      RAISE EXCEPTION 'Product % is not in your catalog, or has no price.', v_product_id;
+    END IF;
+
+    v_amount := v_quantity * v_unit_price;
+
+    IF v_return_quantity > v_quantity THEN
+      RAISE EXCEPTION
+        'Cannot record % returned against % dispatched for a product.', v_return_quantity, v_quantity;
+    END IF;
+
+    INSERT INTO public.collection_items (
+      collection_id, product_id, quantity, return_quantity, price_per_unit, amount
+    ) VALUES (
+      v_collection_id, v_product_id, v_quantity, v_return_quantity, v_unit_price, v_amount
+    );
+  END LOOP;
+
+  -- Seal the collection. This transition is what fires the stock deduction.
+  UPDATE public.collections
+  SET total_amount = v_total_amount,
+      status = 'completed'
+  WHERE id = v_collection_id;
+
+  RETURN v_collection_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.record_collection(UUID, TEXT, JSONB) IS
+  'Records a dispatch at catalog prices. Warns when the restaurant is over its '
+  'credit limit but does not block: the delivery happened, so refusing to record '
+  'it would corrupt stock as well as debt.';
 
 COMMIT;

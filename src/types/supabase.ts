@@ -471,6 +471,87 @@ export interface Database {
           },
         ]
       }
+      /** Unallocated credit per restaurant: advance payments not yet matched
+       *  to an invoice. Replaces the old behaviour where an overpayment simply
+       *  disappeared from the money-owed figures. */
+      restaurant_credit: {
+        Row: {
+          company_id: string
+          restaurant_id: string
+          amount: number
+          updated_at: string
+        }
+        Insert: {
+          company_id: string
+          restaurant_id: string
+          amount?: number
+          updated_at?: string
+        }
+        Update: {
+          company_id?: string
+          restaurant_id?: string
+          amount?: number
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "restaurant_credit_company_id_fkey"
+            columns: ["company_id"]
+            isOneToOne: false
+            referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "restaurant_credit_restaurant_id_fkey"
+            columns: ["restaurant_id"]
+            isOneToOne: false
+            referencedRelation: "restaurants"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      /** Which invoice each slice of a payment settled. Derived, never
+       *  authoritative: payments.amount is what was actually received and is
+       *  what a receipt must report. */
+      payment_allocations: {
+        Row: {
+          id: string
+          payment_id: string
+          invoice_id: string
+          amount: number
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          payment_id: string
+          invoice_id: string
+          amount: number
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          payment_id?: string
+          invoice_id?: string
+          amount?: number
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "payment_allocations_invoice_id_fkey"
+            columns: ["invoice_id"]
+            isOneToOne: false
+            referencedRelation: "invoices"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "payment_allocations_payment_id_fkey"
+            columns: ["payment_id"]
+            isOneToOne: false
+            referencedRelation: "payments"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       bill_items: {
         Row: {
           id: string
@@ -694,6 +775,66 @@ export interface Database {
         Args: {
           p_default_gst_rate: number
         }
+        Returns: undefined
+      }
+          /** Records a payment and allocates it oldest-invoice-first. Surplus becomes
+       *  restaurant_credit rather than disappearing. p_invoice_id may be NULL for
+       *  an advance. Required params come first: Postgres requires every
+       *  parameter after the first defaulted one to also be defaulted. */
+      record_payment: {
+        Args: {
+          p_restaurant_id: string
+          p_amount: number
+          p_payment_mode: string
+          p_invoice_id?: string
+          p_payment_date?: string
+          p_reference?: string
+        }
+        Returns:
+          | {
+              payment_id: string
+              allocated: number
+              credit_left: number
+              invoices_hit: number
+            }[]
+          | null
+      }
+      /** Issues one invoice per distinct restaurant from verified collections.
+       *  Returns a row per invoice issued; skipped collections produce no row. */
+      generate_bulk_invoices_batch: {
+        Args: { p_collection_ids: string[] }
+        Returns:
+          | {
+              restaurant_id: string
+              restaurant_name: string
+              invoice_id: string
+              invoice_number: string
+              total_amount: number
+            }[]
+          | null
+      }
+      /** Outstanding balance and credit-limit breach. credit_limit = 0 means
+       *  unlimited. */
+      restaurant_credit_status: {
+        Args: { p_restaurant_id: string; p_extra_amount?: number }
+        Returns: { outstanding: number; credit_limit: number; exceeded: boolean }[]
+      }
+      /** Outstanding balance against a restaurant's credit limit, for surfacing
+       *  on the day's route. unlimited = TRUE when credit_limit is 0. */
+      restaurant_credit_exposure: {
+        Args: { p_restaurant_id: string }
+        Returns:
+          | {
+              outstanding: number
+              credit_limit: number
+              headroom: number
+              exceeded: boolean
+              unlimited: boolean
+            }[]
+          | null
+      }
+      refresh_invoice_status_for_restaurant: {
+        Args: { p_restaurant_id: string }
         Returns: undefined
       }
       update_user_status: {

@@ -17,19 +17,25 @@ export default function DownloadReceiptButton({ data }: { data: ReceiptData }) {
     typeof navigator.share === 'function' &&
     typeof navigator.canShare === 'function'
 
+  // An advance has no invoice, so the filename and share text fall back to the
+  // payment id. Dereferencing data.invoice here threw on exactly those payments.
+  const reference = data.invoice?.invoice_number ?? data.payment_id
+
   const handleShare = async () => {
     try {
       setIsGenerating(true)
       
       // Generate Blob
       const blob = await pdf(<ReceiptPDF data={data} />).toBlob()
-      const file = new File([blob], `receipt_${data.invoice.invoice_number}.pdf`, { type: 'application/pdf' })
+      const file = new File([blob], `receipt_${reference}.pdf`, { type: 'application/pdf' })
 
       if (canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({
           files: [file],
           title: 'Payment Receipt',
-          text: `Payment Receipt for Invoice ${data.invoice.invoice_number}`
+          text: data.invoice
+            ? `Payment Receipt for Invoice ${data.invoice.invoice_number}`
+            : 'Payment Receipt — received on account'
         })
       } else {
         // Fallback to direct download

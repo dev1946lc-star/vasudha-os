@@ -14,6 +14,7 @@ type PaymentWithRelations = {
   payment_mode: string | null
   payment_date: string
   reference_number: string | null
+  restaurant_id: string
   company: { name: string; address: string | null; gst_number: string | null; logo_url: string | null } | null
   restaurant: { name: string; phone: string | null } | null
   invoice: { invoice_number: string } | null
@@ -39,6 +40,31 @@ export default async function PaymentReceiptPage({ params }: { params: Promise<{
     notFound()
   }
 
+  // Which bills this payment actually closed. One payment can settle several, so
+  // the receipt must show the split rather than naming a single invoice.
+  const { data: allocationRows } = await supabase
+    .from('payment_allocations')
+    .select('amount, invoice:invoices (invoice_number)')
+    .eq('payment_id', id)
+    .order('created_at', { ascending: true })
+
+  const allocations = (allocationRows ?? []).flatMap((row) => {
+    const embedded = Array.isArray(row.invoice) ? row.invoice[0] : row.invoice
+    if (!embedded?.invoice_number) return []
+    return [{ invoice_number: embedded.invoice_number, amount: Number(row.amount) }]
+  })
+
+  // Credit held after allocation, so the receipt agrees with the account. Read
+  // as the balance, not a delta: the receipt is a point-in-time statement.
+  const { data: creditRows } = await supabase
+    .from('restaurant_credit')
+    .select('amount')
+    .eq('restaurant_id', payment.restaurant_id ?? '')
+    .limit(1)
+
+  const creditLeft = creditRows?.[0]?.amount ?? 0
+  const isAdvance = allocations.length === 0
+
   // Format data for the PDF Generator
   const pdfData = {
     payment_id: payment.id,
@@ -48,7 +74,14 @@ export default async function PaymentReceiptPage({ params }: { params: Promise<{
     reference_number: payment.reference_number,
     restaurant: payment.restaurant,
     company: payment.company,
-    invoice: payment.invoice,
+    // The embedded invoice is only populated for payments inserted before
+    // migration 31, which recorded the match inline. Everything since is carried
+    // by payment_allocations, so the first allocation stands in.
+    invoice: payment.invoice ?? (allocations[0]
+      ? { invoice_number: allocations[0].invoice_number }
+      : null),
+    allocations,
+    creditLeft: isAdvance ? Number(creditLeft) : 0,
   }
 
   return (
@@ -61,7 +94,11 @@ export default async function PaymentReceiptPage({ params }: { params: Promise<{
           <div>
             <h1 className="text-2xl font-bold text-slate-900">Payment Receipt</h1>
             <p className="text-sm text-slate-500">
-              Receipt for Invoice {payment.invoice?.invoice_number}
+              {isAdvance
+                ? "Received on account"
+                : payment.invoice?.invoice_number
+                  ? `Receipt for Invoice ${payment.invoice.invoice_number}`
+                  : `Receipt — ${allocations.length} bills settled`}
             </p>
           </div>
         </div>
@@ -123,10 +160,43 @@ export default async function PaymentReceiptPage({ params }: { params: Promise<{
             </div>
           )}
 
-          <div className="flex justify-between items-center py-3">
-            <span className="text-sm text-slate-500 ml-6">Applied to Invoice</span>
-            <span className="font-medium text-slate-900">{payment.invoice?.invoice_number}</span>
-          </div>
+          {/* One payment can close several bills, and an advance closes none.
+              Both cases need to read correctly rather than printing a blank. */}
+          {isAdvance ? (
+            <div className="flex justify-between items-center py-3">
+              <span className="text-sm text-slate-500 ml-6">Applied to</span>
+              <span className="font-medium text-slate-900">Payment on account (advance)</span>
+            </div>
+          ) : (
+            <div className="py-3">
+              <p className="text-sm text-slate-500 mb-2">
+                {allocations.length > 1
+                  ? `Bills Settled (${allocations.length})`
+                  : "Applied to Invoice"}
+              </p>
+              {allocations.length > 0 ? (
+                <ul className="space-y-1">
+                  {allocations.map((a) => (
+                    <li key={a.invoice_number} className="flex justify-between text-sm">
+                      <span className="font-medium text-slate-900">{a.invoice_number}</span>
+                      <span className="text-slate-600">₹{a.amount.toFixed(2)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <span className="font-medium text-slate-900 text-sm">
+                  {payment.invoice?.invoice_number}
+                </span>
+              )}
+            </div>
+          )}
+
+          {isAdvance && Number(creditLeft) > 0 && (
+            <div className="flex justify-between items-center py-3 border-t border-slate-50">
+              <span className="text-sm text-slate-500 ml-6">Credit Held On Account</span>
+              <span className="font-medium text-emerald-700">₹{Number(creditLeft).toFixed(2)}</span>
+            </div>
+          )}
         </div>
         
         <div className="p-6 bg-slate-50 border-t border-slate-100 text-center">

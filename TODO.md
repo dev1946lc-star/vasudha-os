@@ -323,7 +323,106 @@ pointer to `14b`. `14b` also needs `DROP VIEW` before `CREATE`: Postgres refuses
 - **`/payments/new?restaurant_id=` links are dead** — `NewPaymentPage` never reads
   the param.
 
-### Platform mismatch, unresolved
+## Phase 9: Advance payments, FIFO, batch billing, credit limit (migration 31)
+
+The three gaps closed from the audit, in the order they block a working day.
+
+### Advance payments and FIFO allocation
+
+`payments.invoice_id` was NOT NULL and the form disabled submit without an unpaid
+invoice, so the most common real-world event was unrepresentable: a restaurant
+handing over a round number against several bills, or paying before the period is
+even billed.
+
+- `payments.invoice_id` is now nullable
+- `record_payment()` inserts one row and allocates the money server-side,
+  **oldest bill first** by `due_date` then `invoice_date`
+- `payment_allocations` records which invoice each slice settled. `payments.amount`
+  stays authoritative because that is what a receipt must report
+- `restaurant_credit` holds unabsorbed surplus. This was the silent defect: the
+  old views filtered on `status IN ('unpaid','partial')`, so **an overpayment
+  simply vanished from the money-owed figures** — the liability was understated
+  with nothing to show for it
+- credit is spent by the next payment before it reaches any bill
+
+Allocation ordering is `due_date` first, not insertion order. There is a test that
+inserts two bills newest-first and asserts the later-due one is left alone,
+because a naive `ORDER BY id` would settle the wrong bill and still pass every
+other assertion.
+
+### One source of truth for "how much is settled"
+
+Invoice status came from `payments.invoice_id` while the new views netted off
+`payment_allocations`. Two answers to one question: a bill closed by an advance
+would read `unpaid` in the views and `partial` in the column, and the next
+payment touching it would flip it back.
+
+Resolved by making `payment_allocations` authoritative and adding a trigger so a
+payment that names an invoice directly still produces an allocation. Existing rows
+are backfilled before the trigger is created. Without that ordering step,
+already-paid bills read as unpaid mid-migration.
+
+### Batch billing across restaurants
+
+`generate_bulk_invoice` raised *"All collections must belong to the same
+restaurant"*, so the spec's "200 bills in 15 minutes" was 200 manual cycles.
+`generate_bulk_invoices_batch()` groups by restaurant and issues one invoice each,
+delegating to `generate_bulk_invoice` per group rather than reimplementing its
+validation in a second place.
+
+Unverified and already-invoiced collections are **skipped, not fatal** — one stop
+awaiting verification must not block billing the other 199. The UI now selects
+across restaurants, offers select-all / per-restaurant toggles, and shows what was
+issued instead of navigating away, because "done" is not a useful confirmation when
+200 invoices were raised at once.
+
+### Credit limit
+
+`credit_limit` was stored, displayed, and checked by nothing.
+`restaurant_credit_exposure()` reports outstanding, limit, headroom and
+`exceeded`; `record_collection` warns.
+
+**It warns rather than blocks**, per spec. A hard block strands a driver at a
+kitchen with goods on the truck, and since the delivery physically happened,
+refusing to record it corrupts the stock count as well as the debt. The warning is
+surfaced on the route: a badge per over-limit stop plus a count, so the driver
+knows before leaving rather than finding out on a statement weeks later.
+
+`credit_limit = 0` means unlimited, not zero allowance — tested explicitly,
+because the naive reading would flag every such restaurant.
+
+### Also fixed
+- `record_collection` now prices from `products.price`, ignoring the submitted
+  `unit_price`. A tampered form could otherwise set the price. Tested by dispatching
+  with `unit_price: 0.01` and asserting the line is priced at the catalog value.
+- `record_collection` refuses returns exceeding the dispatched quantity — a larger
+  figure would credit more stock than left the warehouse.
+- `ReceiptPDF` dereferenced `invoice.invoice_number` unconditionally while
+  `payments.invoice_id` is now nullable. Renders "Payment on account (advance)",
+  lists the bills settled, and shows credit held. Same null-safe fix in
+  `DownloadReceiptButton`'s filename and share text.
+- `/payments/new?restaurant_id=` links from `/outstanding` were dead — the page
+  never read the param. Now read, and soft-deleted restaurants are excluded.
+- `PaymentForm` shows the allocation outcome before navigating. With FIFO the
+  money may have closed four bills and left credit; silently redirecting hid the
+  one thing the user needs to tell the customer.
+
+### Two bugs found while testing this
+Both were mine, and both produced wrong money before the tests caught them:
+1. Credit was applied to the payment **and** counted again in the final balance,
+   producing a **negative** credit balance. Fixed by tracking `v_credit_used`
+   separately from `v_credit` held.
+2. `record_payment` wrote the caller's `invoice_id` *and* did FIFO allocation, so
+   the sync trigger created a competing allocation and double-counted against that
+   bill. Fixed by always writing `invoice_id` as NULL and letting the allocation
+   rows be the record.
+
+### Test counts
+DB checks went 73 → 140. The e2e suite went 78 → 78 (unchanged; the API is
+read-only and this is all write-path). Two fixture expectations needed updating
+for the new `deleted_at` / auto-inventory-row behaviour.
+
+## Platform mismatch, unresolved
 `archive_docs/MVP.md` specifies a **native Android app**: PIN auth, Android 8.0+,
 SQLite, 100% offline, APK size, battery drain. The build is a **Next.js web app**
 with Clerk email auth and Supabase. The 39 in-scope features were mapped against a
