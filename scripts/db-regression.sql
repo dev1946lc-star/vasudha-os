@@ -1152,16 +1152,20 @@ BEGIN
   SELECT * INTO r FROM public.record_payment(
     'aa000000-0000-4000-8000-00000000000a', 1000, 'upi', NULL, CURRENT_DATE, 'ADV-2');
 
-  PERFORM pg_temp.assert(r.allocated::TEXT, '400.00',
-    'an advance settles the remaining 200 on bill 2 and 400 of bill 3');
-  PERFORM pg_temp.assert(r.credit_left::TEXT, '600.00',
+  -- Outstanding after (a): bill 2 owes 200, bill 3 owes 500 -> 700 absorbable.
+  -- So a 1000 payment allocates exactly 700 and carries 300 forward. The point
+  -- is not the specific figure but that the 300 survives as credit; before
+  -- migration 31 it was silently dropped.
+  PERFORM pg_temp.assert(r.allocated::TEXT, '700.00',
+    'an advance settles every open bill it can reach, oldest first');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '300.00',
     'the unabsorbed remainder is held as credit rather than disappearing');
 END;
 $$;
 
 SELECT pg_temp.assert(
   (SELECT amount::TEXT FROM public.restaurant_credit
-    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '600.00',
+    WHERE restaurant_id = 'aa000000-0000-4000-8000-00000000000a'), '300.00',
   'restaurant_credit holds the overpayment');
 
 -- This is the defect being fixed: the surplus used to vanish from the
@@ -1186,10 +1190,10 @@ BEGIN
   SELECT * INTO r FROM public.record_payment(
     'aa000000-0000-4000-8000-00000000000a', 500, 'cash', NULL, CURRENT_DATE, 'ADV-3');
 
-  PERFORM pg_temp.assert(r.credit_left::TEXT, '100.00',
-    'the new payment draws down the 600 of credit before allocating');
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '0.00',
+    'the new payment draws down the 300 of credit before allocating');
   PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
-    'with credit available the whole payment is consumed by it');
+    'with 300 of credit held, all 500 is consumed by it and nothing is allocated');
 END;
 $$;
 
@@ -1211,7 +1215,7 @@ BEGIN
 
   PERFORM pg_temp.assert(r.allocated::TEXT, '0.00',
     'a payment with nothing to absorb is not allocated to anything');
-  PERFORM pg_temp.assert(r.credit_left::TEXT, '350.00',
+  PERFORM pg_temp.assert(r.credit_left::TEXT, '250.00',
     'it simply increases the credit held');
 END;
 $$;
