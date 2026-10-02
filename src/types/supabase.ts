@@ -202,6 +202,12 @@ export interface Database {
           invoice_number: string
           invoice_date: string
           due_date: string
+          /** draft -> approved -> sent -> (unpaid|partial|paid|overdue), plus cancelled. */
+          approved_at: string | null
+          sent_at: string | null
+          cancelled_at: string | null
+          /** Recorded permanently; a cancellation with no explanation is unauditable. */
+          cancellation_reason: string | null
           subtotal: number
           cgst: number
           sgst: number
@@ -217,6 +223,12 @@ export interface Database {
           invoice_number: string
           invoice_date: string
           due_date: string
+          /** draft -> approved -> sent -> (unpaid|partial|paid|overdue), plus cancelled. */
+          approved_at: string | null
+          sent_at: string | null
+          cancelled_at: string | null
+          /** Recorded permanently; a cancellation with no explanation is unauditable. */
+          cancellation_reason: string | null
           subtotal: number
           cgst?: number
           sgst?: number
@@ -232,6 +244,10 @@ export interface Database {
           invoice_number?: string
           invoice_date?: string
           due_date?: string
+          approved_at?: string | null
+          sent_at?: string | null
+          cancelled_at?: string | null
+          cancellation_reason?: string | null
           subtotal?: number
           cgst?: number
           sgst?: number
@@ -818,6 +834,35 @@ export interface Database {
       restaurant_credit_status: {
         Args: { p_restaurant_id: string; p_extra_amount?: number }
         Returns: { outstanding: number; credit_limit: number; exceeded: boolean }[]
+      }
+      /** draft -> approved. Freezes the collections behind the invoice. Only a
+       *  draft is approvable, and never one with no amount. */
+      approve_invoice: {
+        Args: { p_invoice_id: string }
+        Returns: string
+      }
+      /** approved -> sent. Only now is the bill money owed, because a bill the
+       *  customer has not received is not a debt. */
+      send_invoice: {
+        Args: { p_invoice_id: string }
+        Returns: string
+      }
+      /** Cancels a bill (credit note). Any money received moves to
+       *  restaurant_credit rather than vanishing, and the collections are released
+       *  for re-billing. Requires a reason; owner only. */
+      cancel_invoice: {
+        Args: { p_invoice_id: string; p_reason?: string }
+        Returns: string
+      }
+      /** TRUE when a bill represents money owed. draft/approved are not yet owed. */
+      invoice_is_collectible: {
+        Args: { p_status: string }
+        Returns: boolean
+      }
+      /** TRUE when a collection feeds an approved bill and can no longer change. */
+      collection_is_frozen: {
+        Args: { p_collection_id: string }
+        Returns: boolean
       }
       /** Outstanding balance against a restaurant's credit limit, for surfacing
        *  on the day's route. unlimited = TRUE when credit_limit is 0. */

@@ -20,19 +20,31 @@ export function canAccessRoute(role: Role, pathname: string): boolean {
   const isSettings = pathname.startsWith('/settings')
   
   if (role === 'manager') {
-    // Managers cannot access billing endpoints or owner settings
-    if (isBilling || isSettings) {
+    // Managers run the business day to day, which includes raising and issuing
+    // bills. They were previously locked out of billing entirely while
+    // accountants -- who per the spec are read-only on operations -- could
+    // verify collections. Both halves of that were backwards.
+    //
+    // Owner-only settings (users, tax, company profile) stay closed.
+    if (isSettings) {
       return false
     }
     return true
   }
 
   if (role === 'accountant') {
-    // Accountants cannot access operational collections/inventory edits or settings
+    // Accountants own the books: billing, payments, outstanding and reports. They
+    // are read-only on operations -- no stock adjustments, and no verifying
+    // someone else's delivery, which is a manager's sign-off.
     if (isSettings) {
       return false
     }
-    // They can access billing, reports, dashboard
+    if (pathname.startsWith('/inventory/add')) {
+      return false
+    }
+    if (pathname.startsWith('/collections/new')) {
+      return false
+    }
     return true
   }
 

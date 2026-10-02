@@ -1128,9 +1128,12 @@ $$;
 SELECT pg_temp.assert(
   (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000001'),
   'paid', 'the oldest bill is settled first, not the newest');
+-- 'overdue', not 'partial': bill 2 was due 5 days ago, so a part payment leaves
+-- it past due. Overdue outranks partial because it is the actionable state, and
+-- the shortfall is still visible as outstanding_amount.
 SELECT pg_temp.assert(
   (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000002'),
-  'partial', 'the spill leaves the second bill partially paid');
+  'overdue', 'the spill leaves the second bill overdue, not merely partial');
 SELECT pg_temp.assert(
   (SELECT status FROM public.invoices WHERE id = 'ab000000-0000-4000-8000-000000000003'),
   'unpaid', 'the newest bill is untouched');
@@ -1622,6 +1625,433 @@ BEGIN
   END;
 END;
 $$;
+
+-- ── 10. Bill lifecycle: draft -> approved -> sent -> settled (migration 32) ──
+--
+-- Previously an invoice was created already payable and immediately 'unpaid', so
+-- there was no review window and nothing to approve. Worse, the collections
+-- behind an issued bill stayed editable by a manager, so the amounts on the
+-- customer's copy could drift away from what was actually delivered.
+
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days)
+VALUES ('aa100000-0000-4000-8000-00000000000a',
+        '11111111-1111-1111-1111-111111111111', 'Lifecycle Probe', 15);
+
+-- Two verified deliveries so the invoice has a real amount to freeze.
+INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
+                                collection_date, status, total_amount)
+VALUES
+  ('ab100000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
+   'aa100000-0000-4000-8000-00000000000a', 'user_2ownerTEST000000000001',
+   CURRENT_DATE, 'verified', 0),
+  ('ab100000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
+   'aa100000-0000-4000-8000-00000000000a', 'user_2ownerTEST000000000001',
+   CURRENT_DATE, 'verified', 0);
+
+INSERT INTO public.collection_items (collection_id, product_id, quantity,
+                                     return_quantity, price_per_unit, amount)
+VALUES
+  ('ab100000-0000-4000-8000-000000000001', '88888888-8888-8888-8888-888888888888', 2, 0, 100, 200),
+  ('ab100000-0000-4000-8000-000000000002', '88888888-8888-8888-8888-888888888888', 3, 1, 100, 300);
+
+-- (a) Billing produces a DRAFT, not a payable invoice.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  v_id := public.generate_bulk_invoice(ARRAY[
+    'ab100000-0000-4000-8000-000000000001'::UUID,
+    'ab100000-0000-4000-8000-000000000002'::UUID]);
+  PERFORM pg_temp.assert_true(v_id IS NOT NULL, 'a draft invoice was raised');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'draft', 'billing produces a draft, not a bill that is already owed');
+
+-- A draft is not money owed. This is the whole point of the review window.
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.invoice_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'a draft invoice is excluded from outstanding');
+
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.invoice_aging
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'a draft invoice is excluded from ageing');
+
+SELECT pg_temp.assert(
+  (SELECT COALESCE(total_outstanding, 0)::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'a draft invoice adds nothing to the restaurant debt total');
+
+-- The deliveries are linked at draft stage, so they cannot be billed twice.
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.collections
+    WHERE invoice_id = (SELECT id FROM public.invoices
+                         WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a')), '2',
+  'collections are linked at draft stage, preventing a second billing');
+
+-- Returns are still netted: 5 dispatched, 1 returned => 4 x 100 + 5% GST = 420.
+SELECT pg_temp.assert(
+  (SELECT total_amount::TEXT FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '420.00',
+  'the draft is priced net of returns');
+
+-- (b) An unapproved invoice cannot be sent, and a draft cannot receive a payment.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+  BEGIN
+    PERFORM public.send_invoice(v_id);
+    RAISE EXCEPTION 'FAILED: an unapproved invoice should not be sendable';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%must be approved%' THEN
+      RAISE NOTICE 'ok  sending an unapproved invoice is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- A customer's advance must not silently settle a bill they have not received.
+  DECLARE r RECORD;
+  BEGIN
+    SELECT * INTO r FROM public.record_payment(
+      'aa100000-0000-4000-8000-00000000000a', 100, 'cash', NULL, CURRENT_DATE, 'EARLY');
+    PERFORM pg_temp.assert(r.allocated::TEXT, '0',
+      'a payment does not allocate to a draft invoice');
+    PERFORM pg_temp.assert(r.credit_left::TEXT, '100',
+      'the unabsorbed payment is held as credit instead');
+  END;
+END;
+$$;
+
+-- Clear that credit so the later assertions reason about a clean account.
+UPDATE public.restaurant_credit SET amount = 0
+WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+-- (c) approve -> sent. Only a sent invoice is money owed.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+  PERFORM public.approve_invoice(v_id);
+  PERFORM pg_temp.assert_true(
+    (SELECT approved_at IS NOT NULL FROM public.invoices WHERE id = v_id),
+    'approving records when the bill was reviewed');
+
+  PERFORM pg_temp.assert(
+    (SELECT status FROM public.invoices WHERE id = v_id), 'approved',
+    'approval moves the draft forward');
+
+  -- Approval is not idempotent-hostile: a double click is not an error.
+  PERFORM public.approve_invoice(v_id);
+  RAISE NOTICE 'ok  approving twice is a no-op, not a failure';
+
+  PERFORM public.send_invoice(v_id);
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'unpaid', 'a sent invoice becomes money owed');
+-- ::TEXT on the boolean, because assert() takes TEXT and Postgres will not
+-- implicitly cast boolean to it.
+SELECT pg_temp.assert(
+  (SELECT (sent_at IS NOT NULL)::TEXT FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'true', 'sending records when the customer received the bill');
+SELECT pg_temp.assert(
+  (SELECT COALESCE(total_outstanding, 0)::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '420.00',
+  'a sent invoice appears in the money owed');
+
+-- (d) THE FREEZE. This is what made "approved" meaningless before: the
+-- deliveries behind an issued bill could still be edited, so the amounts on the
+-- customer's copy drifted from what had actually been delivered.
+DO $$
+DECLARE
+  v_role TEXT := 'owner';
+BEGIN
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2ownerTEST000000000001',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'owner')
+  )::TEXT);
+
+  -- Even an owner is refused. Changing an issued bill should go through a
+  -- cancellation, which leaves an audit trail.
+  BEGIN
+    UPDATE public.collections SET notes = 'rewritten after approval'
+    WHERE id = 'ab100000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION 'FAILED: a frozen collection must not be editable';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%approved invoice%' THEN
+      RAISE NOTICE 'ok  a collection feeding an issued invoice is frozen';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- And the line items, which are insertable independently of the parent.
+  BEGIN
+    INSERT INTO public.collection_items (collection_id, product_id, quantity,
+                                         return_quantity, price_per_unit, amount)
+    VALUES ('ab100000-0000-4000-8000-000000000001', '88888888-8888-8888-8888-888888888888',
+            99, 0, 100, 9900);
+    RAISE EXCEPTION 'FAILED: line items on a frozen collection must be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%approved invoice%' THEN
+      RAISE NOTICE 'ok  line items on a frozen collection are refused too';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  BEGIN
+    UPDATE public.collection_items SET quantity = 999
+    WHERE collection_id = 'ab100000-0000-4000-8000-000000000002';
+    RAISE EXCEPTION 'FAILED: editing a frozen line item must be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%approved invoice%' THEN
+      RAISE NOTICE 'ok  editing a frozen line item is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- The invoice itself is unchanged, which is the point: the freeze held.
+SELECT pg_temp.assert(
+  (SELECT total_amount::TEXT FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '420.00',
+  'the issued bill is unchanged by the attempted edits');
+
+-- (e) Overdue is derived from due_date, never stored stale.
+UPDATE public.invoices
+SET due_date = CURRENT_DATE - 10,
+    invoice_date = CURRENT_DATE - 25
+WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+  PERFORM public.refresh_invoice_status(v_id);
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'overdue', 'a sent bill past its due date becomes overdue');
+
+-- A part payment on an overdue bill keeps it overdue: that is the actionable
+-- state, and the shortfall still shows as outstanding_amount.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+  PERFORM public.record_payment('aa100000-0000-4000-8000-00000000000a',
+    120, 'cash', NULL, CURRENT_DATE, 'PART-1');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'overdue', 'a part payment on an overdue bill keeps it overdue');
+SELECT pg_temp.assert(
+  (SELECT outstanding_amount::TEXT FROM public.invoice_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '300.00',
+  'the unpaid shortfall is still visible as an outstanding amount');
+
+-- Settling it in full clears the overdue state.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+  PERFORM public.record_payment('aa100000-0000-4000-8000-00000000000a',
+    300, 'cash', NULL, CURRENT_DATE, 'PART-2');
+  -- Asserting sent_at survives settlement: the record of when the customer got
+  -- the bill must not be overwritten by the payment that closed it.
+  IF NOT (SELECT sent_at IS NOT NULL FROM public.invoices WHERE id = v_id) THEN
+    RAISE EXCEPTION 'FAILED: settling the bill cleared sent_at';
+  END IF;
+  RAISE NOTICE 'ok  paying does not disturb the sent record';
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'paid', 'an overdue bill settles to paid, so overdue is never stale');
+SELECT pg_temp.assert(
+  (SELECT COALESCE(total_outstanding, 0)::TEXT FROM public.restaurant_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'a paid bill leaves the money owed');
+
+-- (f) Cancellation is a credit note: it reverses the money and releases the
+-- deliveries. Previously there was no path at all, so a voided bill kept counting
+-- as owed.
+DO $$
+DECLARE
+  v_id UUID;
+  v_credit NUMERIC;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+  -- A reason is mandatory: "why was this voided" always comes up later.
+  BEGIN
+    PERFORM public.cancel_invoice(v_id, '   ');
+    RAISE EXCEPTION 'FAILED: cancelling without a reason should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%reason is required%' THEN
+      RAISE NOTICE 'ok  a cancellation without a reason is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  PERFORM public.cancel_invoice(v_id, 'Wrong price on two cans');
+
+  SELECT amount INTO v_credit FROM public.restaurant_credit
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+  -- 420 was received against a bill that no longer exists, so it becomes credit
+  -- rather than a silent refund gap.
+  PERFORM pg_temp.assert(v_credit::TEXT, '420.00',
+    'money received against a cancelled bill becomes credit, not a loss');
+END;
+$$;
+
+SELECT pg_temp.assert(
+  (SELECT status FROM public.invoices WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'cancelled', 'the invoice is cancelled');
+SELECT pg_temp.assert(
+  (SELECT cancellation_reason FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'),
+  'Wrong price on two cans', 'the cancellation reason is recorded for audit');
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.collections
+    WHERE id IN ('ab100000-0000-4000-8000-000000000001',
+                 'ab100000-0000-4000-8000-000000000002')
+      AND invoice_id IS NULL), '2',
+  'cancelling releases the deliveries so they can be re-billed');
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.invoice_outstanding
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'a cancelled bill is not money owed');
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.payment_allocations a
+    JOIN public.invoices i ON i.id = a.invoice_id
+    WHERE i.restaurant_id = 'aa100000-0000-4000-8000-00000000000a'), '0',
+  'allocations against a cancelled bill are cleared');
+
+-- A cancelled bill is never resurrected by a later payment.
+DO $$
+DECLARE v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM public.invoices
+    WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+  PERFORM public.refresh_invoice_status(v_id);
+  IF NOT (SELECT status = 'cancelled' FROM public.invoices WHERE id = v_id) THEN
+    RAISE EXCEPTION 'FAILED: a cancelled invoice was resurrected by a status recompute';
+  END IF;
+  RAISE NOTICE 'ok  a cancelled invoice stays cancelled when its status is recomputed';
+END;
+$$;
+
+-- (g) Guards on the transitions themselves.
+DO $$
+DECLARE
+  v_draft UUID;
+  v_role_setup TEXT;
+BEGIN
+  SELECT id INTO v_draft FROM public.invoices
+  WHERE restaurant_id = 'aa100000-0000-4000-8000-00000000000a';
+
+  -- Only a draft can be approved.
+  BEGIN
+    PERFORM public.approve_invoice(v_draft);
+    RAISE EXCEPTION 'FAILED: only a draft should be approvable';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%Only a draft%' THEN
+      RAISE NOTICE 'ok  approving a cancelled invoice is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- Another tenant cannot touch it. Ownership is checked before the state, so a
+  -- caller cannot learn a bill's status by watching which error comes back.
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2otherTEST000000000001',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', 'aaaaaaaa-0000-4000-8000-000000000001', 'role', 'owner')
+  )::TEXT);
+
+  BEGIN
+    PERFORM public.approve_invoice(v_draft);
+    RAISE EXCEPTION 'FAILED: another tenant must not approve this invoice';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%does not belong to your company%' THEN
+      RAISE NOTICE 'ok  another tenant cannot approve the invoice';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- An accountant may approve but not cancel: a void is an owner decision.
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2agentTEST000000000002',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'accountant')
+  )::TEXT);
+
+  BEGIN
+    PERFORM public.cancel_invoice(v_draft, 'should not be allowed');
+    RAISE EXCEPTION 'FAILED: an accountant must not cancel an invoice';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%may not perform%' OR SQLERRM LIKE '%Not authorized%' THEN
+      RAISE NOTICE 'ok  cancelling is restricted to the owner';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- Restore owner for the remainder.
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2ownerTEST000000000001',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'owner')
+  )::TEXT);
+END;
+$$;
+
+-- (h) invoice_is_collectible is the single definition of "money owed", so a new
+-- state cannot be forgotten in one view and remembered in another.
+SELECT pg_temp.assert_true(
+  public.invoice_is_collectible('unpaid') AND public.invoice_is_collectible('partial')
+  AND public.invoice_is_collectible('overdue'),
+  'issued bills count as money owed');
+SELECT pg_temp.assert_true(
+  NOT public.invoice_is_collectible('draft') AND NOT public.invoice_is_collectible('approved'),
+  'a bill not yet issued is not money owed');
+SELECT pg_temp.assert_true(
+  NOT public.invoice_is_collectible('paid') AND NOT public.invoice_is_collectible('cancelled'),
+  'a settled bill is not money owed');
 
 ROLLBACK;
 

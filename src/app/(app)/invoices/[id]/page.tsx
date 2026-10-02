@@ -2,8 +2,14 @@ import { createClient } from "@/lib/supabase/server"
 import { notFound } from "next/navigation"
 import DownloadPDFButton from "@/components/invoices/DownloadPDFButton"
 import type { InvoiceData, InvoiceLineItem } from "@/components/invoices/InvoicePDF"
-import { ArrowLeft, Building2, MapPin, ReceiptText } from "lucide-react"
+import { ArrowLeft, Building2, MapPin, ReceiptText, CheckCircle2, Ban, FileText } from "lucide-react"
 import Link from "next/link"
+import { auth } from "@clerk/nextjs/server"
+import { resolveAccess } from "@/lib/session-claims"
+import {
+  InvoiceLifecycleActions,
+  InvoiceStatusBadge,
+} from "@/components/invoices/InvoiceLifecycle"
 
 // Note: In Next.js App Router, we fetch data on the server component
 export default async function InvoiceDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -59,6 +65,24 @@ export default async function InvoiceDetailPage({ params }: { params: Promise<{ 
   }))
 
   // Prepare full data structure for the PDF generator
+  // Only the owner may void a bill. Read from the authoritative profile rather
+  // than the JWT claims: a freshly-onboarded user has no claims yet and would
+  // otherwise be shown no actions at all.
+  const { userId } = await auth()
+  const access = userId ? await resolveAccess(userId) : null
+  const isOwner = access?.role === "owner"
+
+  // The generated schema types invoices.status as plain TEXT, so it arrives as
+  // `string`. Narrow it once here rather than casting at each use site: a status
+  // outside the known set falls back to 'unpaid' rather than reaching a component
+  // that switches on it.
+  const KNOWN = [
+    'draft','approved','sent','unpaid','partial','paid','overdue','cancelled',
+  ] as const
+  const status: (typeof KNOWN)[number] = (KNOWN as readonly string[]).includes(invoice.status)
+    ? (invoice.status as (typeof KNOWN)[number])
+    : 'unpaid'
+
   const pdfData = {
     ...invoice,
     items: lineItems
@@ -81,11 +105,62 @@ export default async function InvoiceDetailPage({ params }: { params: Promise<{ 
           </div>
         </div>
         
-        {/* `InvoiceData` declares the embedded `company`/`restaurant` columns as
-            non-nullable while the schema makes them nullable, so the payload is
-            handed over unchanged. */}
-        <DownloadPDFButton data={pdfData as unknown as InvoiceData} />
+        <div className="flex flex-col sm:flex-row sm:items-start gap-4">
+<div className="flex flex-col gap-3 sm:items-end">
+            <InvoiceStatusBadge status={status} />
+            <InvoiceLifecycleActions
+              invoiceId={invoice.id}
+              status={status}
+              totalAmount={Number(invoice.total_amount)}
+              isOwner={isOwner}
+            />
+          </div>
+          {/* A draft is not owed and a cancelled one is void: neither should be
+              handed to the customer as if it were a live bill. */}
+          {status !== 'draft' && status !== 'cancelled' && (
+            /* `InvoiceData` declares the embedded `company`/`restaurant` columns as
+                non-nullable while the schema makes them nullable, so the payload is
+                handed over unchanged. */
+            <DownloadPDFButton data={pdfData as unknown as InvoiceData} />
+          )}
+        </div>
       </div>
+
+      {/* Banner explaining where the bill stands, since the lifecycle is not
+          obvious from a status word alone. */}
+      {status === 'draft' && (
+        <div className="mb-6 flex items-start gap-3 p-4 bg-slate-100 border border-slate-300 rounded-lg">
+          <FileText className="h-5 w-5 text-slate-500 shrink-0 mt-0.5" />
+          <p className="text-sm text-slate-700">
+            <strong className="font-semibold">This is a draft.</strong> It has not been sent and
+            is not money owed. Approve it to review and freeze the deliveries behind it, then send
+            it to the customer.
+          </p>
+        </div>
+      )}
+
+      {status === 'approved' && (
+        <div className="mb-6 flex items-start gap-3 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+          <CheckCircle2 className="h-5 w-5 text-blue-600 shrink-0 mt-0.5" />
+          <p className="text-sm text-blue-800">
+            <strong className="font-semibold">Approved and frozen.</strong> The deliveries behind
+            this bill can no longer be edited, so the amounts here will always match what was
+            delivered. Send it to make it money owed.
+          </p>
+        </div>
+      )}
+
+      {status === 'cancelled' && (
+        <div className="mb-6 flex items-start gap-3 p-4 bg-red-50 border border-red-200 rounded-lg">
+          <Ban className="h-5 w-5 text-red-600 shrink-0 mt-0.5" />
+          <p className="text-sm text-red-800">
+            <strong className="font-semibold">Cancelled.</strong>{' '}
+            {invoice.cancellation_reason ? `Reason: ${invoice.cancellation_reason}. ` : ''}
+            Any money received against this bill was moved to the restaurant&apos;s credit, and the
+            deliveries were released for re-billing.
+          </p>
+        </div>
+      )}
 
       {/* Invoice HTML Preview */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">

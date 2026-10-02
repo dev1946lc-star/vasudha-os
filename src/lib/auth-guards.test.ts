@@ -5,7 +5,7 @@ function runTests() {
   console.log("Running Route Guard Tests...\n")
 
   // Test Manager Constraints
-  assert.strictEqual(canAccessRoute('manager', '/billing'), false, "Manager should NOT access /billing")
+  assert.strictEqual(canAccessRoute('manager', '/billing'), true, "Manager should access /billing")
   assert.strictEqual(canAccessRoute('manager', '/settings'), false, "Manager should NOT access /settings")
   assert.strictEqual(canAccessRoute('manager', '/dashboard'), true, "Manager should access /dashboard")
   assert.strictEqual(canAccessRoute('manager', '/collections'), true, "Manager should access /collections")

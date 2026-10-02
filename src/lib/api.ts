@@ -102,13 +102,27 @@ export type PaymentsResponse = {
   page_size: number
 }
 
+export type InvoiceStatus =
+  | 'draft'
+  | 'approved'
+  | 'sent'
+  | 'unpaid'
+  | 'partial'
+  | 'paid'
+  | 'overdue'
+  | 'cancelled'
+
 export type Invoice = {
   id: string
   invoice_number: string
   restaurant_name: string
   invoice_date: string
-  status: string
+  status: InvoiceStatus
   total_amount: number
+  /** Drives the ageing and overdue clock. */
+  due_date: string
+  /** True once approved: the deliveries behind it are permanently frozen. */
+  is_frozen: boolean
 }
 
 export type InvoicesResponse = {
@@ -183,14 +197,23 @@ async function rustFetch<T>(path: string): Promise<T> {
 
   const companyId = await resolveCompanyId()
 
-  const res = await fetch(`${RUST_API_URL}${path}`, {
-    headers: {
-      'x-api-key': RUST_API_SECRET,
-      'x-company-id': companyId,
-    },
-    // Next.js: opt out of caching so data is always fresh
-    cache: 'no-store',
-  })
+  let res: Response
+  try {
+    res = await fetch(`${RUST_API_URL}${path}`, {
+      headers: {
+        'x-api-key': RUST_API_SECRET,
+        'x-company-id': companyId,
+      },
+      // Next.js: opt out of caching so data is always fresh
+      cache: 'no-store',
+    })
+  } catch (err: unknown) {
+    throw new Error(
+      `Failed to connect to Rust API at ${RUST_API_URL}${path}. ` +
+        `Ensure the backend is running (e.g. 'npm run api' or 'cargo run --manifest-path backend/Cargo.toml'). ` +
+        `Original error: ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
 
   if (!res.ok) {
     if (res.status === 401) {

@@ -1,6 +1,12 @@
 import { api } from "@/lib/api"
 import Link from "next/link"
 import { FileText, Eye, Plus, ChevronLeft, ChevronRight } from "lucide-react"
+import { auth } from "@clerk/nextjs/server"
+import { resolveAccess } from "@/lib/session-claims"
+import {
+  InvoiceLifecycleActions,
+  InvoiceStatusBadge,
+} from "@/components/invoices/InvoiceLifecycle"
 
 export const revalidate = 30 // ISR: revalidate every 30 seconds
 
@@ -16,6 +22,14 @@ export default async function BillingPage({
 
   const { data: invoices, total } = await api.billing(page)
   const totalPages = Math.ceil(total / PAGE_SIZE)
+
+  // Only the owner may void a bill, so the server decides whether to offer it
+  // rather than the client. Read from the authoritative profile rather than the
+  // JWT claims: a user who onboarded minutes ago has no claims yet, and would
+  // otherwise be shown no actions at all.
+  const { userId } = await auth()
+  const access = userId ? await resolveAccess(userId) : null
+  const isOwner = access?.role === "owner"
 
   return (
     <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
@@ -61,26 +75,36 @@ export default async function BillingPage({
                     {inv.restaurant_name}
                   </td>
                   <td className="px-6 py-4">
-                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                      inv.status === 'paid' ? 'bg-emerald-100 text-emerald-800' :
-                      inv.status === 'draft' ? 'bg-slate-100 text-slate-800' :
-                      'bg-amber-100 text-amber-800'
-                    }`}>
-                      {inv.status || 'Generated'}
-                    </span>
+                    <InvoiceStatusBadge status={inv.status} />
+                    {inv.status === 'overdue' && (
+                      <div className="text-xs text-red-600 mt-1">
+                        due {new Date(inv.due_date).toLocaleDateString()}
+                      </div>
+                    )}
                   </td>
                   <td className="px-6 py-4 text-right">
                     <div className="font-bold text-slate-900">
                       ₹{Number(inv.total_amount).toFixed(2)}
                     </div>
+                    {inv.status === 'draft' && (
+                      <div className="text-xs text-slate-400 mt-0.5">not yet owed</div>
+                    )}
                   </td>
                   <td className="px-6 py-4 text-right">
-                    <Link 
-                      href={`/invoices/${inv.id}`}
-                      className="inline-flex items-center gap-1 text-sm font-medium text-blue-600 hover:text-blue-800"
-                    >
-                      <Eye className="h-4 w-4" /> View
-                    </Link>
+                    <div className="flex items-center justify-end gap-4">
+                      <InvoiceLifecycleActions
+                        invoiceId={inv.id}
+                        status={inv.status}
+                        totalAmount={Number(inv.total_amount)}
+                        isOwner={isOwner}
+                      />
+                      <Link
+                        href={`/invoices/${inv.id}`}
+                        className="inline-flex items-center gap-1 text-sm font-medium text-blue-600 hover:text-blue-800"
+                      >
+                        <Eye className="h-4 w-4" /> View
+                      </Link>
+                    </div>
                   </td>
                 </tr>
               ))}

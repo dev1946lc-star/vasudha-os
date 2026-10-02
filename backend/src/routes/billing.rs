@@ -16,6 +16,11 @@ pub struct Invoice {
     pub invoice_date: String,
     pub status: String,
     pub total_amount: f64,
+    /// Drives the ageing and overdue clock. NOT NULL since migration 29.
+    pub due_date: String,
+    /// True once the bill has been approved. The deliveries behind it can no
+    /// longer be edited, which is what makes "approved" mean something.
+    pub is_frozen: bool,
 }
 
 #[derive(Serialize)]
@@ -40,7 +45,10 @@ pub async fn get_invoices(
         r#"
         SELECT COUNT(*)::BIGINT
         FROM invoices i
-        JOIN restaurants r ON r.id = i.restaurant_id AND r.company_id = i.company_id
+        JOIN restaurants r
+          ON r.id = i.restaurant_id
+         AND r.company_id = i.company_id
+         AND r.deleted_at IS NULL
         WHERE i.company_id = $1
         "#,
     )
@@ -60,9 +68,16 @@ pub async fn get_invoices(
             r.name AS restaurant_name,
             i.invoice_date::TEXT AS invoice_date,
             COALESCE(i.status, 'unpaid') AS status,
-            CAST(i.total_amount AS FLOAT8) AS total_amount
+            CAST(i.total_amount AS FLOAT8) AS total_amount,
+            i.due_date::TEXT AS due_date,
+            (i.approved_at IS NOT NULL) AS is_frozen
         FROM invoices i
-        JOIN restaurants r ON r.id = i.restaurant_id AND r.company_id = i.company_id
+        JOIN restaurants r
+          ON r.id = i.restaurant_id
+         AND r.company_id = i.company_id
+         -- A soft-deleted restaurant keeps its invoices for the audit trail, but
+         -- must not appear in the working billing list.
+         AND r.deleted_at IS NULL
         WHERE i.company_id = $1
         ORDER BY i.invoice_date DESC, i.created_at DESC
         LIMIT $2 OFFSET $3
