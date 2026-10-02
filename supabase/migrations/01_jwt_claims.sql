@@ -1,0 +1,15 @@
+-- 01_jwt_claims.sql
+--
+-- RETIRED. This migration mirrored role/company_id into auth.users.raw_app_meta_data
+-- so they would appear in the JWT for RLS. That is the Supabase Auth mechanism, but
+-- the application authenticates with Clerk, which owns identity and never writes
+-- to auth.users — so the trigger did nothing.
+--
+-- Worse, once profiles.id became TEXT (Clerk ids are strings, not UUIDs) this
+-- trigger fired on every profile write and failed with "operator does not exist:
+-- uuid = text", aborting the insert.
+--
+-- 26_clerk_identity.sql drops it and replaces it with a clerk_metadata mirror
+-- table the Next.js server copies onto the Clerk user.
+
+-- Intentionally empty.
