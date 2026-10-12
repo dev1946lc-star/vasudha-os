@@ -191,15 +191,15 @@ export default function CollectionsClient({
             prev.map((c) => (c.id === existingCollectionId ? { ...c, status: "in_progress" } : c))
           )
         } else {
-          // Create initial collection with in_progress status
           const today = new Date().toISOString().split("T")[0]
+          const effectiveCompanyId = storeUser?.company_id || "11111111-1111-1111-1111-111111111111"
           const { data, error } = await supabase
             .from("collections")
             .insert({
               restaurant_id: restaurantId,
               status: "in_progress",
               collection_date: today,
-              company_id: "", // Injected by RLS default or trigger
+              company_id: effectiveCompanyId,
               agent_id: activeUserId || "",
             })
             .select("id, restaurant_id, status, total_amount, not_available_reason, verified_at, agent_id")
@@ -217,7 +217,7 @@ export default function CollectionsClient({
         setActionInProgress(null)
       }
     },
-    [activeUserId]
+    [activeUserId, storeUser?.company_id]
   )
 
   const handleOpenUnavailableModal = (
@@ -264,6 +264,7 @@ export default function CollectionsClient({
         )
       } else {
         const today = new Date().toISOString().split("T")[0]
+        const effectiveCompanyId = storeUser?.company_id || "11111111-1111-1111-1111-111111111111"
         const { data, error } = await supabase
           .from("collections")
           .insert({
@@ -271,7 +272,7 @@ export default function CollectionsClient({
             status: "not_available",
             not_available_reason: reasonToSave,
             collection_date: today,
-            company_id: "",
+            company_id: effectiveCompanyId,
             agent_id: activeUserId || "",
           })
           .select("id, restaurant_id, status, total_amount, not_available_reason, verified_at, agent_id")

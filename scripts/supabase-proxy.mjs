@@ -137,6 +137,21 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  if (!headers['authorization']) {
+    const defaultToken = createJwt({
+      role: 'authenticated',
+      sub: 'user_anonymous',
+      aud: 'authenticated',
+      app_metadata: {
+        company_id: DEFAULT_COMPANY_ID,
+        role: 'owner',
+      },
+      iat: Math.floor(Date.now() / 1000) - 10,
+      exp: Math.floor(Date.now() / 1000) + 7200,
+    })
+    headers['authorization'] = `Bearer ${defaultToken}`
+  }
+
   const options = {
     hostname: '127.0.0.1',
     port: TARGET_PORT,
