@@ -217,7 +217,7 @@ export default function CollectionsClient({
         setActionInProgress(null)
       }
     },
-    [activeUserId, storeUser?.company_id]
+    [activeUserId, storeUser]
   )
 
   const handleOpenUnavailableModal = (
