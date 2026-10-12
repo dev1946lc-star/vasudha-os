@@ -83,8 +83,8 @@ export default async function SalesReportPage({
           </form>
           <ExportReportButtons 
             data={[
-              ...products.map((p) => ({ Type: 'Product', Name: p.product_name, Volume_kg: p.total_quantity, Revenue_Rs: p.total_revenue })),
-              ...restaurants.map((r) => ({ Type: 'Restaurant', Name: r.restaurant_name, Volume_kg: r.total_quantity, Revenue_Rs: r.total_revenue }))
+              ...products.map((p) => ({ Type: 'Product', Name: p.product_name, Volume_Units: p.total_quantity, Revenue_Rs: p.total_revenue })),
+              ...restaurants.map((r) => ({ Type: 'Restaurant', Name: r.restaurant_name, Volume_Units: r.total_quantity, Revenue_Rs: r.total_revenue }))
             ]}
             filename={`Sales_Report_${startDate}_to_${endDate}`}
           />
@@ -99,7 +99,7 @@ export default async function SalesReportPage({
           </div>
           <div>
             <p className="text-sm font-medium text-slate-500">Total Volume Sold</p>
-            <p className="text-3xl font-bold text-slate-900">{totalVolume.toFixed(2)} <span className="text-lg text-slate-500 font-normal">kg</span></p>
+            <p className="text-3xl font-bold text-slate-900">{totalVolume.toFixed(2)} <span className="text-lg text-slate-500 font-normal">units</span></p>
           </div>
         </div>
 
@@ -127,7 +127,7 @@ export default async function SalesReportPage({
               <thead>
                 <tr className="bg-white text-slate-500 text-xs uppercase tracking-wider border-b border-slate-100">
                   <th className="px-6 py-3 font-medium">Product</th>
-                  <th className="px-6 py-3 font-medium text-right">Volume (kg)</th>
+                  <th className="px-6 py-3 font-medium text-right">Volume (Units)</th>
                   <th className="px-6 py-3 font-medium text-right">Revenue</th>
                 </tr>
               </thead>
@@ -155,7 +155,7 @@ export default async function SalesReportPage({
               <thead className="bg-white text-xs uppercase text-slate-500 border-b border-slate-100">
                 <tr>
                   <th className="px-6 py-3 font-medium">Restaurant</th>
-                  <th className="px-6 py-3 font-medium text-right">Volume (kg)</th>
+                  <th className="px-6 py-3 font-medium text-right">Volume (Units)</th>
                   <th className="px-6 py-3 font-medium text-right">Revenue</th>
                 </tr>
               </thead>

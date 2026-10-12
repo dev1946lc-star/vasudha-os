@@ -422,6 +422,95 @@ DB checks went 73 → 140. The e2e suite went 78 → 78 (unchanged; the API is
 read-only and this is all write-path). Two fixture expectations needed updating
 for the new `deleted_at` / auto-inventory-row behaviour.
 
+## Phase 10: Bill lifecycle (migration 32)
+
+An "approved" invoice did not exist before. Invoices were raised already payable
+and immediately `unpaid`, so there was no review window, nothing to approve, and
+nothing frozen. Worse, the deliveries behind an issued bill stayed editable by a
+manager, so the amounts on the customer's copy could drift away from what was
+actually delivered — and nothing in the product said so.
+
+### States added
+- `draft` — raised, not yet issued. **Not money owed**, so excluded from every view.
+- `approved` — reviewed and frozen. Deliveries behind it become immutable.
+- `sent` — delivered. Records when, which nothing did before.
+- `overdue` — derived from `due_date`, never stored.
+- `cancelled` — now reachable, with a real reversal path.
+
+Only a **sent** invoice counts as money owed. A bill the customer has not received
+is not a debt, and until now the money was owed from the moment the button was
+pressed.
+
+### Overdue is derived, not stored
+`refresh_invoice_status` computes it from `due_date` plus allocations. A stored
+flag would go stale the moment an invoice was paid, and a sweep would need a
+scheduler this project does not have. Deriving it means "overdue" is true at the
+moment of reading, with no interval in which it is wrong.
+
+Overdue outranks `partial`, because it is the actionable state; the shortfall is
+still visible as `outstanding_amount`.
+
+### The freeze
+`collection_is_frozen()` is keyed on `approved_at`, **not** on status. `sent` is
+transient — `send_invoice` moves straight to `unpaid` — so a status list would
+unfreeze the deliveries exactly when the freeze matters most. Enforced on both
+`collections` and `collection_items`, because line items are insertable
+independently of their parent.
+
+For every role including owner. Changing an issued bill goes through a
+cancellation, which leaves an audit trail.
+
+First attempt gated the freeze on a status change, which let the most damaging
+edit through: rewriting `notes` or `collection_date` without touching `status` at
+all. The freeze is about the row being immutable, not about which column moved.
+
+### Cancellation reverses the money
+Previously a void had nowhere to go: allocations stayed and the outstanding
+figures still counted the bill. Now any money received moves to
+`restaurant_credit` rather than becoming an unexplained gap, the collections are
+released for re-billing, and a **reason is mandatory** — "why was this voided"
+always comes up later. Owner only; an accountant may approve but not void.
+
+### One predicate for "money owed"
+`invoice_is_collectible()` replaces the `status IN ('unpaid','partial')` list that
+was duplicated in five places. `14b` exists largely because one copy was missed.
+Both `record_payment` and both views now use the predicate.
+
+### A stale view, found by reading the live schema
+`invoice_aging` was a duplicate created in migration 29 that **no later migration
+updated**. It still netted off `payments.invoice_id` (so advance payments did not
+reduce it) and still filtered `status IN ('unpaid','partial')` (so it showed
+**drafts as money owed**). Migration 32 rebuilt it from `invoice_outstanding`, so
+duplicated logic can no longer drift.
+
+The 189-check suite passed throughout — the fixtures never exercised the
+difference. It was found by reading `pg_get_viewdef` against the running stack
+after a live check disagreed. Four regression checks were added so the suite
+catches this class next time.
+
+### Role matrix corrected
+Managers were locked out of billing entirely while accountants — read-only on
+operations per the spec — could verify collections. Both halves were backwards.
+Managers now run billing; accountants are read-only on collections and stock.
+
+### UI
+- `/billing` and the invoice page carry the lifecycle controls: Approve → Send,
+  plus Cancel for the owner. Each maps to one RPC rather than a status dropdown,
+  because a dropdown would let a caller skip approval and lose the reason.
+- Sending asks for confirmation, since that is the moment money becomes owed.
+- PDF download is hidden for drafts and cancelled bills — neither should be handed
+  to a customer as a live bill.
+- `billing.rs` now returns `due_date` and `is_frozen`, and excludes soft-deleted
+  restaurants from the working list.
+
+### Also fixed
+- `setup-local-db.mjs` only worked against a fresh container: re-running it failed
+  with `relation "profiles" already exists`. Now drops and recreates the public
+  schema first, and reports the real migration count.
+
+### Test counts
+DB checks 140 → **189**. e2e 78 → 78 (the API is read-only; this is all write-path).
+
 ## Platform mismatch, unresolved
 `archive_docs/MVP.md` specifies a **native Android app**: PIN auth, Android 8.0+,
 SQLite, 100% offline, APK size, battery drain. The build is a **Next.js web app**
@@ -429,6 +518,59 @@ with Clerk email auth and Supabase. The 39 in-scope features were mapped against
 web implementation; items 1 (PIN auth), the offline requirement (AC-01) and the
 performance targets are not achievable on this stack as written.
 
-Also on this machine, unrelated to the code: only **0.4 GB free of 15.3 GB**. A
-stale `next start -p 3100` from the smoke suite was holding RAM; it has been
-stopped. Several unrelated `omni-*` containers are also running.
+## Phase 11: Operations Completeness & UI Layer (migration 33)
+
+Migration 33 closed six foundational operational gaps across the schema and database triggers.
+The UI layer across all affected modules is now 100% complete and verified:
+
+### 1. Returns Reason + Restockable
+- Added `return_reason` and `return_restockable` to `collection_items` schema & DB check constraint.
+- Form validation (`src/lib/validations/collection.ts`) enforces reasons (`damaged`, `expired`, `wrong_item`, `excess`, `quality`, `not_ordered`, `other`) whenever `return_quantity > 0`.
+- `CollectionForm.tsx` conditionally reveals the return reason dropdown and an interactive Restockable vs Wastage toggle.
+- Non-restockable returns automatically ledger into `stock_entries` as `wastage` rather than disappearing into a single net delta.
+
+### 2. Stock Movement Ledger (`stock_entries`)
+- Added `/inventory/ledger` route with real-time transaction ledger:
+  - Tracks every movement: Purchases, Opening Stock, Dispatches, Customer Returns, Wastage, Adjustments, and Physical Counts.
+  - Displays transition balances (`quantity_before` → `quantity_after`), signed deltas, units, supplier GSTIN, batch/lot numbers, and notes.
+  - KPI summary row (Units In, Dispatched, Restocked, Wasted) and CSV export.
+- Tabbed navigation in `/inventory` toggling seamlessly between current stock levels and the ledger.
+- Upgraded `/inventory/add` to call `add_stock` with full migration 33 parameters: movement type (`purchase`, `adjustment`, `physical_count`), unit cost, supplier, supplier GSTIN, batch, expiry, and notes.
+
+### 3. 8-State Collection Machine & Agent Scoping
+- Reachable states in UI: `pending` / `pending_visit`, `draft`, `assigned`, `in_progress`, `completed`, `verified`, `not_available`, `cancelled`.
+- Status badges and action triggers for permitted transitions:
+  - `pending` / `assigned` → "Start Visit" (`in_progress`) or "Mark Unavailable".
+  - `in_progress` → "Record Collection" (`completed`) or "Mark Unavailable".
+  - `completed` → "Verify & Lock" (manager/owner only, locked for agents).
+  - `not_available` → Modal requiring mandatory reason selection/input, conforming to DB trigger constraint.
+- Agent scoping:
+  - Role-aware route view: agents see and operate on their own deliveries; managers and owners supervise company-wide stops.
+
+### 4. Units of Measure (`unit`, `quantity_scale`)
+- Added `unit` and `quantity_scale` fields to `products` schema, `ProductForm.tsx`, and `ProductsClient.tsx`.
+- Pricing and inventory quantities now render appropriate units (can, kg, l, litre, pouch, crate, etc.) instead of hardcoded kilograms.
+- Cleaned hardcoded `kg` from `/reports/daily` and `/reports/sales`.
+
+### 5. GSTR-1, GSTR-3B & Wastage Reports
+- Upgraded `/reports/gst`:
+  - **GSTR-1**: HSN-wise outward supplies grouped by HSN code and rate with B2B/B2C classification and CSV export.
+  - **GSTR-3B**: Monthly return summarizing inward supplies (ITC broken down by CGST, SGST, IGST), outward tax liabilities, and net tax payable.
+  - **Invoice Breakdown**: Audit view of all issued bills for reconciliation.
+- Added `/reports/wastage`:
+  - Tracks monthly damaged/spoiled write-offs, units lost, estimated financial losses, and CSV export.
+- Updated `/reports` hub with quick navigation to all compliance and audit reports.
+
+### 6. Backup & Restore
+- Added `stock_entries` to `/api/backup` export manifest.
+- Implemented `POST /api/backup` restore endpoint:
+  - Enforces owner/manager authorization and caller tenant isolation.
+  - Restores records across 8 tables in foreign-key dependency order with upsert semantics.
+- Revamped `/settings/backup` UI with file selection, JSON inspection, confirmation guard, restore progress feedback, and per-table itemized counts.
+
+### Test counts
+DB checks: **229 passed**. API checks: **78 passed**. Typecheck: **clean**. Production build: **all routes compiled**.
+
+## Still outstanding
+- **Dashboard metrics nuance**: Today's revenue reflects cash payments recorded rather than delivered invoice value; monthly revenue KPI can be added to top row.
+- **Hosted Supabase synchronization**: Migrations 28–33 are applied to the local PostgreSQL database stack. When deploying to a cloud-hosted Supabase instance, run `supabase db push` to synchronize remote schemas.

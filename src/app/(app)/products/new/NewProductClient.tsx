@@ -65,6 +65,8 @@ export default function NewProductClient({
           price: 0,
           gst_rate: defaultGstRate,
           min_stock_level: 0,
+          unit: "unit",
+          quantity_scale: 1,
           is_active: true,
         }}
       />

@@ -21,6 +21,8 @@ export interface Database {
           total_quantity: number
           total_amount: number
           invoice_id: string | null
+          not_available_reason: string | null
+          verified_at: string | null
           created_at: string
         }
         Insert: {
@@ -34,6 +36,8 @@ export interface Database {
           total_quantity?: number
           total_amount?: number
           invoice_id?: string | null
+          not_available_reason?: string | null
+          verified_at?: string | null
           created_at?: string
         }
         Update: {
@@ -47,6 +51,8 @@ export interface Database {
           total_quantity?: number
           total_amount?: number
           invoice_id?: string | null
+          not_available_reason?: string | null
+          verified_at?: string | null
           created_at?: string
         }
         Relationships: [
@@ -89,6 +95,8 @@ export interface Database {
           return_quantity: number
           price_per_unit: number
           amount: number
+          return_reason: string | null
+          return_restockable: boolean | null
         }
         Insert: {
           id?: string
@@ -98,6 +106,8 @@ export interface Database {
           return_quantity?: number
           price_per_unit: number
           amount: number
+          return_reason?: string | null
+          return_restockable?: boolean | null
         }
         Update: {
           id?: string
@@ -107,6 +117,8 @@ export interface Database {
           return_quantity?: number
           price_per_unit?: number
           amount?: number
+          return_reason?: string | null
+          return_restockable?: boolean | null
         }
         Relationships: [
           {
@@ -344,6 +356,8 @@ export interface Database {
           /** Soft-delete marker. NULL means active. */
           deleted_at: string | null
           min_stock_level: number
+          unit: string | null
+          quantity_scale: number | null
           created_at: string
         }
         Insert: {
@@ -357,6 +371,8 @@ export interface Database {
           is_active?: boolean
           deleted_at?: string | null
           min_stock_level?: number
+          unit?: string | null
+          quantity_scale?: number | null
           created_at?: string
         }
         Update: {
@@ -370,6 +386,8 @@ export interface Database {
           is_active?: boolean
           deleted_at?: string | null
           min_stock_level?: number
+          unit?: string | null
+          quantity_scale?: number | null
           created_at?: string
         }
         Relationships: [
@@ -378,6 +396,90 @@ export interface Database {
             columns: ["company_id"]
             isOneToOne: false
             referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      stock_entries: {
+        Row: {
+          id: string
+          company_id: string
+          product_id: string
+          quantity_change: number
+          quantity_before: number | null
+          quantity_after: number | null
+          entry_type: string
+          reference_type: string | null
+          reference_id: string | null
+          unit_cost: number | null
+          unit_cost_total: number | null
+          unit: string | null
+          supplier: string | null
+          supplier_gstin: string | null
+          batch_number: string | null
+          expiry_date: string | null
+          entry_date: string
+          notes: string | null
+          created_by: string | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          company_id: string
+          product_id: string
+          quantity_change: number
+          quantity_before?: number | null
+          quantity_after?: number | null
+          entry_type: string
+          reference_type?: string | null
+          reference_id?: string | null
+          unit_cost?: number | null
+          unit_cost_total?: number | null
+          unit?: string | null
+          supplier?: string | null
+          supplier_gstin?: string | null
+          batch_number?: string | null
+          expiry_date?: string | null
+          entry_date?: string
+          notes?: string | null
+          created_by?: string | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          company_id?: string
+          product_id?: string
+          quantity_change?: number
+          quantity_before?: number | null
+          quantity_after?: number | null
+          entry_type?: string
+          reference_type?: string | null
+          reference_id?: string | null
+          unit_cost?: number | null
+          unit_cost_total?: number | null
+          unit?: string | null
+          supplier?: string | null
+          supplier_gstin?: string | null
+          batch_number?: string | null
+          expiry_date?: string | null
+          entry_date?: string
+          notes?: string | null
+          created_by?: string | null
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "stock_entries_company_id_fkey"
+            columns: ["company_id"]
+            isOneToOne: false
+            referencedRelation: "companies"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "stock_entries_product_id_fkey"
+            columns: ["product_id"]
+            isOneToOne: false
+            referencedRelation: "products"
             referencedColumns: ["id"]
           },
         ]
@@ -709,17 +811,66 @@ export interface Database {
       }
       gstr1_report: {
         Row: {
-          id: string
           company_id: string
+          hsn_code: string | null
+          gst_rate: number
+          supply_type: string
+          invoice_count: number
+          recipient_count: number
+          taxable_value: number
+          cgst: number
+          sgst: number
+          igst: number
+          total_tax: number
+        }
+        Relationships: []
+      }
+      gst_invoice_detail: {
+        Row: {
+          invoice_id: string
+          company_id: string
+          restaurant_id: string
           recipient_gstin: string
           receiver_name: string
           invoice_number: string
           invoice_date: string
+          due_date: string
           invoice_value: number
           taxable_value: number
           cgst: number
           sgst: number
           igst: number
+          status: string
+        }
+        Relationships: []
+      }
+      gstr3b_report: {
+        Row: {
+          period: string
+          inward_supplies: number
+          input_cgst: number
+          input_sgst: number
+          input_igst: number
+          input_tax_credit: number
+          outward_supplies: number
+          output_cgst: number
+          output_sgst: number
+          output_igst: number
+          output_tax: number
+          net_tax_payable: number
+        }
+        Relationships: []
+      }
+      wastage_report: {
+        Row: {
+          company_id: string
+          product_id: string
+          product_name: string
+          unit: string | null
+          month: string
+          entries: number
+          quantity_wasted: number
+          estimated_value: number
         }
         Relationships: []
       }
@@ -746,6 +897,13 @@ export interface Database {
         Args: {
           p_product_id: string
           p_quantity: number
+          p_entry_type?: string
+          p_unit_cost?: number
+          p_supplier?: string
+          p_batch_number?: string
+          p_expiry_date?: string
+          p_notes?: string
+          p_supplier_gstin?: string
         }
         Returns: undefined
       }

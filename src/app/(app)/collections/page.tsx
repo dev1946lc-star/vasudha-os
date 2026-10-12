@@ -1,10 +1,17 @@
 import { api } from "@/lib/api"
 import { TodayRouteResponse } from "@/lib/api"
-import CollectionsClient from "./CollectionsClient"
+import { auth } from "@clerk/nextjs/server"
+import { resolveAccess } from "@/lib/session-claims"
+import { createClient } from "@/lib/supabase/server"
+import CollectionsClient, { Collection } from "./CollectionsClient"
 
 export const revalidate = 0 // Always fresh — this is a live daily route
 
 export default async function DailyCollectionsPage() {
+  const { userId } = await auth()
+  const access = await resolveAccess(userId ?? "")
+  const role = access?.role ?? "agent"
+
   let routeData: TodayRouteResponse
 
   try {
@@ -28,14 +35,24 @@ export default async function DailyCollectionsPage() {
     phone: stop.phone || null,
   }))
 
-  const collectionsData = routeData.stops
-    .filter((stop) => stop.collection_id !== null)
-    .map((stop) => ({
-      id: stop.collection_id!,
-      restaurant_id: stop.restaurant_id,
-      status: stop.status,
-      total_amount: stop.total_amount,
-    }))
+  // Enrich today's collections with fields from Supabase (not_available_reason, verified_at, agent_id)
+  const supabase = await createClient()
+  const today = new Date().toISOString().split("T")[0]
+  const { data: dbCollections } = await supabase
+    .from("collections")
+    .select("id, restaurant_id, status, total_amount, not_available_reason, verified_at, agent_id")
+    .eq("collection_date", today)
+
+  const collectionsData: Collection[] = (dbCollections || []).length > 0
+    ? (dbCollections as Collection[])
+    : routeData.stops
+        .filter((stop) => stop.collection_id !== null)
+        .map((stop) => ({
+          id: stop.collection_id!,
+          restaurant_id: stop.restaurant_id,
+          status: stop.status,
+          total_amount: stop.total_amount,
+        }))
 
   return (
     <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
@@ -54,10 +71,9 @@ export default async function DailyCollectionsPage() {
       <CollectionsClient
         initialRestaurants={restaurantsData}
         initialCollections={collectionsData}
-        // Credit positions load client-side via restaurant_credit_exposure, one row
-        // per stop. Seeding with [] means the badges appear as they resolve rather
-        // than blocking the route render on N sequential RPCs.
         initialCredit={[]}
+        currentUserId={userId ?? undefined}
+        currentUserRole={role}
       />
     </div>
   )

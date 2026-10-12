@@ -794,4 +794,81 @@ COMMENT ON FUNCTION public.record_payment(UUID, NUMERIC, TEXT, UUID, DATE, TEXT)
   'restaurant_credit. Draft and approved-but-unsent invoices are never allocated '
   'against: the customer has not been billed for them yet.';
 
+-- ── 9. Rebuild invoice_aging, which migration 32 had left stale ──────────
+--
+-- Found by verifying the live stack rather than the test suite: the ageing
+-- report still showed drafts as owed and netted off payments.invoice_id.
+--
+-- Two reasons it had drifted:
+--   * migration 31 repointed the *views* to payment_allocations, but this view
+--     was created separately in migration 29 and never re-pointed, so an advance
+--     payment did not reduce what it reported as overdue.
+--   * migration 32 replaced invoice_outstanding, but not this one, so a draft
+--     appeared in the ageing report as though it were money owed.
+--
+-- Duplicated logic that must be kept in step with a status change is exactly what
+-- this view was, so it now derives from invoice_outstanding rather than repeating
+-- the arithmetic. One definition of "owed" cannot drift.
+
+-- detailed_aging_report is dropped first: it aggregates invoice_aging, so the
+-- dependency blocks the drop below. Order matters here.
+DROP VIEW IF EXISTS public.detailed_aging_report CASCADE;
+DROP VIEW IF EXISTS public.invoice_aging;
+
+CREATE VIEW public.invoice_aging AS
+SELECT
+    a.invoice_id                       AS id,
+    a.company_id,
+    a.restaurant_id,
+    r.name                             AS restaurant_name,
+    a.invoice_number,
+    a.invoice_date,
+    a.due_date,
+    a.total_amount,
+    a.outstanding_amount,
+    a.days_overdue,
+    CASE
+      WHEN a.days_overdue < 0  THEN 'current'
+      WHEN a.days_overdue <= 15 THEN '0-15'
+      WHEN a.days_overdue <= 30 THEN '16-30'
+      WHEN a.days_overdue <= 60 THEN '31-60'
+      ELSE '60+'
+    END AS bucket
+FROM public.invoice_outstanding a
+-- invoice_outstanding carries no name, so the label is joined in here rather than
+-- duplicated into the base view where the rollups would not need it.
+JOIN public.restaurants r
+  ON r.id = a.restaurant_id
+ AND r.company_id = a.company_id
+-- An invoice whose balance has been fully allocated by something outside the
+-- status refresh has nothing to age, so it is not listed.
+WHERE a.outstanding_amount > 0;
+
+COMMENT ON VIEW public.invoice_aging IS
+  'Invoice-level ageing on days past due. Derived from invoice_outstanding so it '
+  'cannot drift from it: draft/approved/cancelled bills are excluded because they '
+  'are not money owed, and an advance payment reduces the reported balance.';
+
+-- detailed_aging_report aggregated invoice_aging. It was also rebuilt in 29 with
+-- its own copy of the bucket names, so re-point it at the same source rather than
+-- leaving a second definition to drift.
+CREATE VIEW public.detailed_aging_report WITH (security_invoker = true) AS
+SELECT
+    a.company_id,
+    a.restaurant_id,
+    a.restaurant_name,
+    COUNT(*)::INT              AS invoice_count,
+    SUM(a.total_amount)        AS total_invoiced,
+    SUM(a.outstanding_amount)  AS total_outstanding,
+    SUM(a.outstanding_amount) FILTER (WHERE a.bucket = 'current') AS current_amount,
+    SUM(a.outstanding_amount) FILTER (WHERE a.bucket = '0-15')   AS bucket_0_15,
+    SUM(a.outstanding_amount) FILTER (WHERE a.bucket = '16-30')  AS bucket_16_30,
+    SUM(a.outstanding_amount) FILTER (WHERE a.bucket = '31-60')  AS bucket_31_60,
+    SUM(a.outstanding_amount) FILTER (WHERE a.bucket = '60+')    AS bucket_60_plus
+FROM public.invoice_aging a
+GROUP BY a.company_id, a.restaurant_id, a.restaurant_name;
+
+COMMENT ON VIEW public.detailed_aging_report IS
+  'Per-restaurant ageing, derived from invoice_aging.';
+
 COMMIT;

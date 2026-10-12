@@ -43,7 +43,7 @@ export function CollectionForm({ restaurants, products, defaultRestaurantId, onS
       restaurant_id: defaultRestaurantId || "",
       notes: "",
       items: [
-        { product_id: products.length > 0 ? products[0].id : "", quantity: 0, return_quantity: 0, unit_price: products.length > 0 ? products[0].price : 0 }
+        { product_id: products.length > 0 ? products[0].id : "", quantity: 0, return_quantity: 0, unit_price: products.length > 0 ? products[0].price : 0, return_reason: undefined, return_restockable: true }
       ],
     },
   })
@@ -120,7 +120,7 @@ export function CollectionForm({ restaurants, products, defaultRestaurantId, onS
           <h3 className="text-lg font-medium text-slate-900">Line Items</h3>
           <button
             type="button"
-            onClick={() => append({ product_id: products[0]?.id || "", quantity: 0, return_quantity: 0, unit_price: products[0]?.price || 0 })}
+            onClick={() => append({ product_id: products[0]?.id || "", quantity: 0, return_quantity: 0, unit_price: products[0]?.price || 0, return_reason: undefined, return_restockable: true })}
             className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors"
           >
             <Plus className="h-4 w-4" /> Add Item
@@ -172,6 +172,41 @@ export function CollectionForm({ restaurants, products, defaultRestaurantId, onS
                 />
                 {errors.items?.[index]?.return_quantity && <p className="mt-1 text-xs text-red-600">{errors.items[index]?.return_quantity?.message}</p>}
               </div>
+
+              {watchItems[index]?.return_quantity > 0 && (
+                <>
+                  <div className="w-full sm:w-44">
+                    <label className="block text-xs font-medium text-slate-500 mb-1">Return Reason</label>
+                    <select
+                      {...register(`items.${index}.return_reason` as const)}
+                      className="block w-full pl-3 pr-8 py-2 text-sm border-slate-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 rounded-md border bg-white"
+                    >
+                      <option value="" disabled>Select reason...</option>
+                      <option value="damaged">Damaged in transit</option>
+                      <option value="expired">Expired / spoilt</option>
+                      <option value="wrong_item">Wrong item delivered</option>
+                      <option value="excess">Excess delivered</option>
+                      <option value="quality">Quality issue</option>
+                      <option value="not_ordered">Not ordered</option>
+                      <option value="other">Other</option>
+                    </select>
+                    {errors.items?.[index]?.return_reason && <p className="mt-1 text-xs text-red-600">{errors.items[index]?.return_reason?.message}</p>}
+                  </div>
+
+                  <div className="w-full sm:w-36 flex flex-col justify-end">
+                    <label className="flex items-center gap-2 cursor-pointer pb-2" title="Checked: returned to sellable stock. Unchecked: written off as wastage.">
+                      <input
+                        type="checkbox"
+                        {...register(`items.${index}.return_restockable` as const)}
+                        className="h-4 w-4 text-blue-600 border-slate-300 rounded focus:ring-blue-500"
+                      />
+                      <span className="text-xs font-medium text-slate-700">
+                        {watchItems[index]?.return_restockable ? 'Restockable' : 'Wastage (Write-off)'}
+                      </span>
+                    </label>
+                  </div>
+                </>
+              )}
 
               <div className="w-full sm:w-24">
                 <label className="block text-xs font-medium text-slate-500 mb-1">Unit Rate (₹)</label>

@@ -83,17 +83,20 @@ VALUES
    'a1000000-0000-4000-8000-000000000001', 'user_2alphaOwner00000000001',
    CURRENT_DATE - 70, 'verified', 12, 1380);
 
+-- return_reason / return_restockable (migration 33): a return must say why, and
+-- say whether the goods went back on the shelf or were written off.
 INSERT INTO public.collection_items (id, collection_id, product_id, quantity,
-                                     return_quantity, price_per_unit, amount)
+                                     return_quantity, price_per_unit, amount,
+                                     return_reason, return_restockable)
 VALUES
   ('e1000000-0000-4000-8000-000000000001', 'd1000000-0000-4000-8000-000000000001',
-   'b1000000-0000-4000-8000-000000000001', 20, 0, 2350, 2350),
+   'b1000000-0000-4000-8000-000000000001', 20, 0, 2350, 2350, NULL, TRUE),
   ('e1000000-0000-4000-8000-000000000002', 'd1000000-0000-4000-8000-000000000002',
-   'b1000000-0000-4000-8000-000000000001', 15, 3, 2350, 1725),
+   'b1000000-0000-4000-8000-000000000001', 15, 3, 2350, 1725, 'damaged', FALSE),
   ('e1000000-0000-4000-8000-000000000003', 'd1000000-0000-4000-8000-000000000003',
-   'b1000000-0000-4000-8000-000000000001', 30, 0, 2350, 3450),
+   'b1000000-0000-4000-8000-000000000001', 30, 0, 2350, 3450, NULL, TRUE),
   ('e1000000-0000-4000-8000-000000000004', 'd1000000-0000-4000-8000-000000000004',
-   'b1000000-0000-4000-8000-000000000001', 12, 0, 2350, 1380);
+   'b1000000-0000-4000-8000-000000000001', 12, 0, 2350, 1380, NULL, TRUE);
 
 -- Invoices spanning every aging bucket and every status.
 --

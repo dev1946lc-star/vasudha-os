@@ -105,8 +105,8 @@ export default async function DailyCollectionReportPage({
             data={cols.map((c) => ({
               "Status": c.status,
               "Restaurant": (c.restaurant as { name?: string } | null)?.name || "Unknown",
-              "Delivered (kg)": c.delivered,
-              "Returned (kg)": c.returned,
+              "Delivered (Units)": c.delivered,
+              "Returned (Units)": c.returned,
               "Amount": Number(c.total_amount ?? 0),
               "Notes": c.notes || ""
             }))}
@@ -121,9 +121,9 @@ export default async function DailyCollectionReportPage({
           <div className="flex justify-between items-start">
             <div>
               <p className="text-sm font-medium text-slate-500">Total Delivered</p>
-              <p className="text-3xl font-bold mt-2 text-slate-900">{totalDelivered.toFixed(1)} <span className="text-lg text-slate-500 font-normal">kg</span></p>
+              <p className="text-3xl font-bold mt-2 text-slate-900">{totalDelivered.toFixed(1)} <span className="text-lg text-slate-500 font-normal">units</span></p>
               <p className="text-xs text-slate-500 mt-1">
-                {totalReturned.toFixed(1)} kg of empty containers returned
+                {totalReturned.toFixed(1)} units of returned items / containers
               </p>
             </div>
             <div className="p-3 bg-emerald-50 rounded-lg text-emerald-600">
@@ -181,8 +181,8 @@ export default async function DailyCollectionReportPage({
               <tr className="bg-white text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200">
                 <th className="px-6 py-4 font-medium">Status</th>
                 <th className="px-6 py-4 font-medium">Restaurant</th>
-                <th className="px-6 py-4 font-medium text-right">Delivered (kg)</th>
-                <th className="px-6 py-4 font-medium text-right">Returned (kg)</th>
+                <th className="px-6 py-4 font-medium text-right">Delivered (Units)</th>
+                <th className="px-6 py-4 font-medium text-right">Returned (Units)</th>
                 <th className="px-6 py-4 font-medium">Notes</th>
               </tr>
             </thead>

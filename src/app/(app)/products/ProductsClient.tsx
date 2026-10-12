@@ -152,7 +152,13 @@ export default function ProductsClient({
                       <div className="text-sm text-slate-500">GST: {product.gst_rate}%</div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm font-medium text-slate-900">₹{product.price}</div>
+                      <div className="text-sm font-medium text-slate-900">
+                        ₹{product.price}{" "}
+                        <span className="text-xs text-slate-500 font-normal">/ {product.unit || "unit"}</span>
+                      </div>
+                      {product.quantity_scale && product.quantity_scale !== 1 && (
+                        <div className="text-xs text-slate-400">Scale: {product.quantity_scale}</div>
+                      )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${

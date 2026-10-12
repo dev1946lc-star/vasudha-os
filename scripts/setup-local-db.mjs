@@ -41,9 +41,23 @@ async function main() {
   psql(authSql + '\n' + rolesSql)
   console.log('   Auth schema and roles created.')
 
-  console.log('2. Applying 27 migrations...')
+  // Start from an empty public schema before replaying the migration chain.
+  //
+  // Without this the script only worked against a fresh container: re-running it
+  // against the local stack failed at 00_initial_schema.sql with
+  // 'relation "profiles" already exists', so the local database could not be
+  // re-seeded after a schema change. Every migration here is written to run
+  // against an empty schema, which is what the chain expects.
+  console.log('   Dropping the existing public schema...')
+  psql(`
+    DROP SCHEMA IF EXISTS public CASCADE;
+    CREATE SCHEMA public;
+    GRANT ALL ON SCHEMA public TO PUBLIC;
+  `)
+
   const migDir = 'supabase/migrations'
   const files = readdirSync(migDir).filter((f) => f.endsWith('.sql')).sort()
+  console.log(`2. Applying ${files.length} migrations...`)
   for (const f of files) {
     const sql = readFileSync(join(migDir, f), 'utf8')
     psql(sql)

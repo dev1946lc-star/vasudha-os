@@ -29,21 +29,47 @@ export default async function InventoryPage() {
   }
 
   return (
-    <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+    <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8 space-y-6">
+      {/* Navigation Tabs between Current Stock and Ledger */}
+      <div className="flex border-b border-slate-200 gap-6">
+        <Link
+          href="/inventory"
+          className="pb-3 text-sm font-semibold text-blue-600 border-b-2 border-blue-600 transition-colors"
+        >
+          Current Stock Levels
+        </Link>
+        <Link
+          href="/inventory/ledger"
+          className="pb-3 text-sm font-medium text-slate-500 hover:text-slate-800 transition-colors flex items-center gap-2"
+        >
+          <Package className="h-4 w-4" />
+          Stock Movement Ledger
+        </Link>
+      </div>
+
       <div className="flex justify-between items-center mb-6">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Inventory Stock</h1>
           <p className="text-sm text-slate-500">Track current stock levels across all products.</p>
         </div>
-        {canAddStock && (
+        <div className="flex items-center gap-3">
           <Link
-            href="/inventory/add"
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium transition-colors"
+            href="/inventory/ledger"
+            className="flex items-center gap-2 px-3 py-2 border border-slate-300 bg-white text-slate-700 rounded-md hover:bg-slate-50 text-sm font-medium transition-colors shadow-sm"
           >
-            <Plus className="h-4 w-4" />
-            Add Stock
+            <Package className="h-4 w-4 text-slate-500" />
+            View Ledger
           </Link>
-        )}
+          {canAddStock && (
+            <Link
+              href="/inventory/add"
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium transition-colors shadow-sm"
+            >
+              <Plus className="h-4 w-4" />
+              Add / Adjust Stock
+            </Link>
+          )}
+        </div>
       </div>
 
       <div className="bg-white shadow-sm border border-slate-200 rounded-lg overflow-hidden">
@@ -76,7 +102,7 @@ export default async function InventoryPage() {
                           </div>
                         {isLowStock && (
                           <div className="text-xs text-red-500 mt-1">
-                            Below minimum of {item.min_stock_level}
+                            Below minimum of {item.min_stock_level} {item.unit || "units"}
                           </div>
                         )}
                       </div>
@@ -84,7 +110,8 @@ export default async function InventoryPage() {
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{item.hsn_code}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
                         <div className={`text-sm font-bold ${isLowStock ? "text-red-600" : "text-slate-900"}`}>
-                          {item.quantity}
+                          {item.quantity}{" "}
+                          <span className="text-xs font-normal text-slate-500">{item.unit || "units"}</span>
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm text-slate-500">

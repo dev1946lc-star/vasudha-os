@@ -99,16 +99,22 @@ INSERT INTO public.products (id, company_id, name, price, hsn_code, gst_rate, mi
 VALUES ('88888888-8888-8888-8888-888888888888',
         '11111111-1111-1111-1111-111111111111', 'Oil', 100, '15121100', 5, 5);
 
--- The products trigger (migration 30) now inserts a zero-quantity inventory row
--- for every new product, so this fixture only has to top it up to 100.
-INSERT INTO public.inventory (company_id, product_id, quantity)
-VALUES ('11111111-1111-1111-1111-111111111111',
-        '88888888-8888-8888-8888-888888888888', 100)
-ON CONFLICT (company_id, product_id) DO UPDATE SET quantity = 100;
+-- Adopt the owner as the caller from here on: the opening entry records
+-- created_by, so the claim has to be in place before it runs.
+SELECT pg_temp.become('11111111-1111-1111-1111-111111111111', 'owner',
+                      'user_2ownerTEST000000000001');
 
--- Every subsequent statement runs as this company/agent.
-SELECT pg_temp.set_app_metadata('{"company_id":"11111111-1111-1111-1111-111111111111","role":"owner"}');
-SELECT pg_temp.set_sub('user_2ownerTEST000000000001');
+-- Seeded through record_stock_entry() rather than a direct INSERT.
+--
+-- Since migration 33 the running inventory figure is a cache of
+-- SUM(stock_entries.quantity_change). Writing to it directly -- as this fixture
+-- used to -- desynchronises the ledger from the balance, which is exactly the
+-- drift the ledger exists to prevent. Stock now always arrives through an entry,
+-- so the two reconcile from this point on.
+SELECT public.record_stock_entry(
+  '11111111-1111-1111-1111-111111111111', '88888888-8888-8888-8888-888888888888',
+  100, 'opening_stock', 'seed', NULL, 100.00, NULL, NULL, NULL, CURRENT_DATE,
+  'Opening stock for the behavioural suite');
 
 -- Assert helper: raises unless the value matches.
 CREATE OR REPLACE FUNCTION pg_temp.assert(actual TEXT, expected TEXT, label TEXT)
@@ -140,7 +146,9 @@ BEGIN
     '22222222-2222-2222-2222-222222222222', 'dispatch',
     jsonb_build_array(jsonb_build_object(
       'product_id', '88888888-8888-8888-8888-888888888888',
-      'quantity', p_qty, 'return_quantity', p_return, 'unit_price', 100))
+      'quantity', p_qty, 'return_quantity', p_return, 'unit_price', 100,
+      -- A reason is mandatory whenever something came back (migration 33).
+      'return_reason', CASE WHEN p_return > 0 THEN 'excess' ELSE NULL END))
   ) INTO v_id;
   RETURN v_id;
 END;
@@ -268,9 +276,13 @@ SELECT pg_temp.assert_true(
   'negative stock is visible rather than silently clamped to zero');
 
 -- Put the count back so later checks are not reasoning about -9913.
-UPDATE public.inventory SET quantity = 100
-WHERE company_id = '11111111-1111-1111-1111-111111111111'
-  AND product_id = '88888888-8888-8888-8888-888888888888';
+--
+-- Through add_stock(), not a direct UPDATE: since migration 33 the running
+-- figure is a cache of the ledger, so writing to it directly would desynchronise
+-- the two and make the reconciliation check meaningless.
+SELECT public.add_stock(
+  '88888888-8888-8888-8888-888888888888', 10013, 'physical_count', NULL, NULL,
+  NULL, NULL, 'Recount after the oversell probe');
 
 -- A product with no stock record at all is a data error, not a count lag, and is
 -- still refused -- otherwise the deduction silently does nothing.
@@ -1649,10 +1661,11 @@ VALUES
    CURRENT_DATE, 'verified', 0);
 
 INSERT INTO public.collection_items (collection_id, product_id, quantity,
-                                     return_quantity, price_per_unit, amount)
+                                     return_quantity, price_per_unit, amount,
+                                     return_reason, return_restockable)
 VALUES
-  ('ab100000-0000-4000-8000-000000000001', '88888888-8888-8888-8888-888888888888', 2, 0, 100, 200),
-  ('ab100000-0000-4000-8000-000000000002', '88888888-8888-8888-8888-888888888888', 3, 1, 100, 300);
+  ('ab100000-0000-4000-8000-000000000001', '88888888-8888-8888-8888-888888888888', 2, 0, 100, 200, NULL, TRUE),
+  ('ab100000-0000-4000-8000-000000000002', '88888888-8888-8888-8888-888888888888', 3, 1, 100, 300, 'excess', TRUE);
 
 -- (a) Billing produces a DRAFT, not a payable invoice.
 DO $$
@@ -2052,6 +2065,676 @@ SELECT pg_temp.assert_true(
 SELECT pg_temp.assert_true(
   NOT public.invoice_is_collectible('paid') AND NOT public.invoice_is_collectible('cancelled'),
   'a settled bill is not money owed');
+
+-- ── 11. Operational completeness (migration 33) ───────────────────────────
+--
+-- Six gaps closed at once. Each has a rule that must hold, so each gets a check
+-- that fails if the rule is removed.
+
+INSERT INTO public.restaurants (id, company_id, name, payment_terms_days)
+VALUES ('f0000000-0000-4000-8000-00000000000a',
+        '11111111-1111-1111-1111-111111111111', 'Ops Probe', 15);
+
+-- ── 11a. Returns must carry a reason ──────────────────────────────────────
+SELECT pg_temp.assert(
+  (SELECT count(*)::TEXT FROM public.collection_items
+    WHERE collection_id = 'ab100000-0000-4000-8000-000000000002'
+      AND return_quantity > 0 AND return_reason IS NOT NULL), '1',
+  'a returned line records why it came back');
+
+-- A reason is enforced, not merely encouraged.
+DO $$
+DECLARE
+  v_cid UUID;
+BEGIN
+  v_cid := public.record_collection(
+    'f0000000-0000-4000-8000-00000000000a', 'reason required',
+    jsonb_build_array(jsonb_build_object(
+      'product_id', '88888888-8888-8888-8888-888888888888',
+        'quantity', 5, 'return_quantity', 2, 'unit_price', 100, 'return_reason', 'excess')));
+
+  BEGIN
+    UPDATE public.collection_items SET return_reason = NULL
+    WHERE collection_id = v_cid;
+    RAISE EXCEPTION 'FAILED: a return without a reason should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%return_reason%' THEN
+      RAISE NOTICE 'ok  clearing the reason on a return is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- An out-of-domain reason is rejected too, so a typo cannot silently pass.
+  BEGIN
+    UPDATE public.collection_items SET return_reason = 'because'
+    WHERE collection_id = v_cid;
+    RAISE EXCEPTION 'FAILED: an arbitrary reason should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%return_reason%' OR SQLERRM LIKE '%check constraint%' THEN
+      RAISE NOTICE 'ok  an unrecognised reason is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- record_collection refuses up front rather than writing an invalid row.
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.record_collection(
+      'f0000000-0000-4000-8000-00000000000a', 'no reason',
+      jsonb_build_array(jsonb_build_object(
+        'product_id', '88888888-8888-8888-8888-888888888888',
+        'quantity', 5, 'return_quantity', 1, 'unit_price', 100)));
+    RAISE EXCEPTION 'FAILED: dispatching a return with no reason should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%reason is required%' THEN
+      RAISE NOTICE 'ok  a return with no reason is refused at entry';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- ── 11b. The stock ledger explains the balance ─────────────────────────────
+SELECT pg_temp.assert_true(
+  (SELECT count(*) > 0 FROM public.stock_entries WHERE company_id = '11111111-1111-1111-1111-111111111111'),
+  'dispatches write stock ledger rows');
+
+-- Every entry carries the balance either side, so a row is self-describing.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (SELECT 1 FROM public.stock_entries WHERE quantity_before IS NULL),
+  'every stock entry records the balance it moved from');
+
+-- The ledger reconciles to the running figure. This is the property that makes
+-- the running number auditable rather than merely plausible.
+SELECT pg_temp.assert(
+  (SELECT SUM(quantity_change)::TEXT FROM public.stock_entries
+    WHERE company_id = '11111111-1111-1111-1111-111111111111'
+      AND product_id = '88888888-8888-8888-8888-888888888888'),
+  (SELECT quantity::TEXT FROM public.inventory
+    WHERE company_id = '11111111-1111-1111-1111-111111111111'
+      AND product_id = '88888888-8888-8888-8888-888888888888'),
+  'the running stock balance equals the sum of the ledger');
+
+-- A purchase is recorded with its supplier and cost, not just a delta.
+SELECT public.add_stock(
+  '88888888-8888-8888-8888-888888888888', 25, 'purchase', 90.00,
+  'Sunrise Traders', 'BATCH-01', CURRENT_DATE + 180, 'Opening top-up');
+
+SELECT pg_temp.assert(
+  (SELECT supplier FROM public.stock_entries
+    WHERE entry_type = 'purchase' ORDER BY created_at DESC LIMIT 1),
+  'Sunrise Traders', 'a purchase records who supplied the goods');
+
+SELECT pg_temp.assert(
+  (SELECT unit_cost::TEXT FROM public.stock_entries
+    WHERE entry_type = 'purchase' ORDER BY created_at DESC LIMIT 1),
+  '90.00', 'a purchase records what it cost');
+
+-- Wastage is separate from a restockable return, so the two are distinguishable.
+--
+-- Both probes are scoped by collection_id rather than by timestamp: the whole
+-- suite runs in one transaction, so NOW() is frozen at BEGIN and every entry
+-- written earlier in the file shares the same created_at.
+DO $$
+DECLARE
+  v_waste  UUID;
+  v_restock UUID;
+BEGIN
+  v_waste := public.record_collection(
+    'f0000000-0000-4000-8000-00000000000a', 'wastage probe',
+    jsonb_build_array(jsonb_build_object(
+      'product_id', '88888888-8888-8888-8888-888888888888',
+      'quantity', 4, 'return_quantity', 2, 'unit_price', 100,
+      'return_reason', 'expired',
+      -- Spolilage goes back on the balance but is not sellable.
+      'return_restockable', false)));
+
+  v_restock := public.record_collection(
+    'f0000000-0000-4000-8000-00000000000a', 'restock probe',
+    jsonb_build_array(jsonb_build_object(
+      'product_id', '88888888-8888-8888-8888-888888888888',
+      'quantity', 4, 'return_quantity', 2, 'unit_price', 100,
+      'return_reason', 'excess',
+      'return_restockable', true)));
+
+  PERFORM pg_temp.assert(
+    (SELECT count(*)::TEXT FROM public.stock_entries
+      WHERE reference_id = v_waste AND entry_type = 'wastage'), '1',
+    'spoiled returns are logged as wastage, not as restocked stock');
+
+  PERFORM pg_temp.assert(
+    (SELECT count(*)::TEXT FROM public.stock_entries
+      WHERE reference_id = v_restock AND entry_type = 'return_from_customer'
+        AND notes LIKE '%restocked%'), '1',
+    'a restockable return is logged separately from wastage');
+
+  -- The two are mutually exclusive for the same delivery: goods either come
+  -- back sellable or they do not.
+  PERFORM pg_temp.assert(
+    (SELECT count(*)::TEXT FROM public.stock_entries
+      WHERE reference_id = v_waste AND entry_type = 'return_from_customer'), '0',
+    'a spoiled return is never also counted as sellable stock');
+
+  PERFORM pg_temp.assert(
+    (SELECT COALESCE(SUM(quantity_wasted), 0)::TEXT
+      FROM public.wastage_report
+      WHERE product_id = '88888888-8888-8888-8888-888888888888'), '2.00',
+    'wastage is reportable per product');
+END;
+$$;
+
+-- A negative add is a correction, never a purchase.
+SELECT public.add_stock(
+  '88888888-8888-8888-8888-888888888888', -3, 'purchase', NULL, NULL, NULL, NULL, 'miscount');
+
+SELECT pg_temp.assert(
+  (SELECT entry_type FROM public.stock_entries
+    WHERE quantity_change = -3 ORDER BY created_at DESC LIMIT 1),
+  'adjustment', 'a negative stock entry is recorded as an adjustment, not a purchase');
+
+-- ── 11c. The full collection state machine ────────────────────────────────
+-- All eight states are admitted, not the six the old constraint allowed.
+-- Asserted by writing each one, because matching pg_get_constraintdef text
+-- pins the test to one Postgres version's parenthesisation.
+DO $$
+DECLARE
+  v_ok  INT := 0;
+  v_s   TEXT;
+  v_cnt INT;
+BEGIN
+  FOREACH v_s IN ARRAY ARRAY['pending','draft','assigned','in_progress',
+                               'completed','verified','not_available','cancelled']
+  LOOP
+    BEGIN
+      INSERT INTO public.collections (
+        id, company_id, restaurant_id, agent_id, collection_date, status, total_amount
+      ) VALUES (
+        gen_random_uuid(), '11111111-1111-1111-1111-111111111111',
+        'f0000000-0000-4000-8000-00000000000a', pg_temp.owner_id(),
+        CURRENT_DATE, v_s, 0);
+      v_ok := v_ok + 1;
+    EXCEPTION WHEN others THEN
+      RAISE EXCEPTION 'FAILED: state % is not admitted: %', v_s, SQLERRM;
+    END;
+  END LOOP;
+
+  PERFORM pg_temp.assert(v_ok::TEXT, '8',
+    'the state machine admits all eight states including not_available');
+
+  -- And a ninth, imaginary one still cannot be written.
+  BEGIN
+    INSERT INTO public.collections (
+      id, company_id, restaurant_id, agent_id, collection_date, status, total_amount
+    ) VALUES (
+      gen_random_uuid(), '11111111-1111-1111-1111-111111111111',
+      'f0000000-0000-4000-8000-00000000000a', pg_temp.owner_id(),
+      CURRENT_DATE, 'teleported', 0);
+    RAISE EXCEPTION 'FAILED: an unknown state should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%collections_status_check%' THEN
+      RAISE NOTICE 'ok  an unknown state is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- An invalid transition is refused, and the error names what is allowed.
+--
+-- Each probe inserts its own row with a known status. Selecting "the most
+-- recent collection for this restaurant" is not usable here: the whole suite
+-- shares one transaction, so created_at does not order anything and the eight
+-- probe rows from the check above would be picked up instead.
+DO $$
+DECLARE v_cid CONSTANT UUID := 'f2000000-0000-4000-8000-000000000001';
+BEGIN
+  -- Starts completed so that completed -> verified is a *legal* edge. That way
+  -- the only thing left to block the update is the role rule, rather than the
+  -- transition rule firing first and masking it.
+  INSERT INTO public.collections (
+    id, company_id, restaurant_id, agent_id, collection_date, status, total_amount
+  ) VALUES (
+    v_cid, '11111111-1111-1111-1111-111111111111',
+    'f0000000-0000-4000-8000-00000000000a', pg_temp.owner_id(),
+    CURRENT_DATE, 'completed', 0);
+
+  -- An agent may never verify: that is a manager's sign-off on someone else's
+  -- work, and the edge itself is legal, so only the role can refuse it.
+  PERFORM pg_temp.become('11111111-1111-1111-1111-111111111111', 'agent',
+                         'user_2agentTEST000000000002');
+
+  BEGIN
+    UPDATE public.collections SET status = 'verified' WHERE id = v_cid;
+    RAISE EXCEPTION 'FAILED: an agent verified a completed collection';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%Agents cannot verify%' THEN
+      RAISE NOTICE 'ok  an agent cannot verify a collection';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  PERFORM pg_temp.assert(
+    (SELECT status FROM public.collections WHERE id = v_cid), 'completed',
+    'the refused verify left the status untouched');
+
+  PERFORM pg_temp.become('11111111-1111-1111-1111-111111111111', 'owner',
+                         'user_2ownerTEST000000000001');
+
+  -- The same edge is fine for a manager, which proves the block above was the
+  -- role and not the state machine.
+  UPDATE public.collections SET status = 'verified' WHERE id = v_cid;
+
+  PERFORM pg_temp.assert(
+    (SELECT status FROM public.collections WHERE id = v_cid), 'verified',
+    'an owner can verify the same collection');
+END;
+$$;
+
+-- And terminal states are final, on top of the role rules above.
+DO $$
+DECLARE
+  v_cid CONSTANT UUID := 'f2000000-0000-4000-8000-000000000003';
+  v_to  TEXT;
+BEGIN
+  INSERT INTO public.collections (
+    id, company_id, restaurant_id, agent_id, collection_date, status, total_amount
+  ) VALUES (
+    v_cid, '11111111-1111-1111-1111-111111111111',
+    'f0000000-0000-4000-8000-00000000000a', pg_temp.owner_id(),
+    CURRENT_DATE, 'pending', 0);
+
+  -- pending -> completed is deliberately allowed: an agent may record a whole
+  -- delivery in one go, so the route is not forced to be walked step by step.
+  UPDATE public.collections SET status = 'completed' WHERE id = v_cid;
+
+  PERFORM pg_temp.assert(
+    (SELECT status FROM public.collections WHERE id = v_cid), 'completed',
+    'an owner can record a delivery without stepping through every state');
+
+  -- cancelled and verified are exits, not waypoints. Nothing follows either.
+  FOREACH v_to IN ARRAY ARRAY['pending','assigned','in_progress','completed']
+  LOOP
+    UPDATE public.collections SET status = 'cancelled' WHERE id = v_cid;
+
+    BEGIN
+      UPDATE public.collections SET status = v_to WHERE id = v_cid;
+      RAISE EXCEPTION 'FAILED: cancelled moved on to %', v_to;
+    EXCEPTION WHEN others THEN
+      IF SQLERRM LIKE '%Cannot move a collection from%' THEN
+        RAISE NOTICE 'ok  cancelled is terminal';
+      ELSE
+        RAISE;
+      END IF;
+    END;
+  END LOOP;
+END;
+$$;
+
+-- "not available" needs a reason, or it is indistinguishable from a missed stop.
+DO $$
+DECLARE v_cid CONSTANT UUID := 'f2000000-0000-4000-8000-000000000002';
+BEGIN
+  -- in_progress -> not_available, the realistic case: the agent got there and the
+  -- shop was shut. It is not reachable from completed, which would be a delivery
+  -- that did happen and must not be closed off after the fact.
+  INSERT INTO public.collections (
+    id, company_id, restaurant_id, agent_id, collection_date, status, total_amount
+  ) VALUES (
+    v_cid, '11111111-1111-1111-1111-111111111111',
+    'f0000000-0000-4000-8000-00000000000a', pg_temp.owner_id(),
+    CURRENT_DATE, 'in_progress', 0);
+
+  BEGIN
+    UPDATE public.collections SET status = 'not_available' WHERE id = v_cid;
+    RAISE EXCEPTION 'FAILED: a stop was closed with no reason';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%reason is required%' THEN
+      RAISE NOTICE 'ok  marking a stop not available requires a reason';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  UPDATE public.collections
+  SET status = 'not_available', not_available_reason = 'Closed for Diwali'
+  WHERE id = v_cid;
+
+  PERFORM pg_temp.assert(
+    (SELECT not_available_reason FROM public.collections WHERE id = v_cid),
+    'Closed for Diwali', 'the reason for a closed stop is recorded');
+
+  -- Terminal: nothing follows it.
+  BEGIN
+    UPDATE public.collections SET status = 'in_progress' WHERE id = v_cid;
+    RAISE EXCEPTION 'FAILED: a terminal state moved on';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%Cannot move a collection from%' THEN
+      RAISE NOTICE 'ok  not_available is terminal';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- And a delivery that was completed cannot afterwards be closed as not
+  -- available: that would erase the fact that goods actually moved.
+  BEGIN
+    UPDATE public.collections
+    SET status = 'not_available', not_available_reason = 'reclassifying'
+    WHERE id = 'f2000000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION 'FAILED: a completed delivery was closed as not available';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%Cannot move a collection from%' THEN
+      RAISE NOTICE 'ok  a completed delivery cannot be reclassified as not available';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
+
+-- ── 11d. An agent owns their own deliveries ───────────────────────────────
+INSERT INTO public.profiles (id, company_id, role, name)
+VALUES ('user_2agentOTHER00000000001', '11111111-1111-1111-1111-111111111111',
+        'agent', 'Other Agent');
+
+INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
+                                collection_date, status, total_amount)
+VALUES ('f1000000-0000-4000-8000-000000000001', '11111111-1111-1111-1111-111111111111',
+        'f0000000-0000-4000-8000-00000000000a', 'user_2agentOTHER00000000001',
+        CURRENT_DATE, 'in_progress', 0);
+
+-- The same collection, but owned by the agent who is about to try to edit it.
+INSERT INTO public.collections (id, company_id, restaurant_id, agent_id,
+                                collection_date, status, total_amount)
+VALUES ('f1000000-0000-4000-8000-000000000002', '11111111-1111-1111-1111-111111111111',
+        'f0000000-0000-4000-8000-00000000000a', 'user_2agentTEST000000000002',
+        CURRENT_DATE, 'in_progress', 0);
+
+DO $$
+DECLARE
+  v_count INT;
+BEGIN
+  -- Become the *other* agent and try to touch a collection that is not theirs.
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2agentTEST000000000002',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'agent')
+  )::TEXT);
+
+  BEGIN
+    UPDATE public.collections SET notes = 'not mine to touch'
+    WHERE id = 'f1000000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION 'FAILED: an agent edited another agent''s collection';
+  EXCEPTION WHEN others THEN
+    -- The fixture is in_progress specifically so the completed-collection freeze
+    -- cannot fire first and mask the ownership rule being tested here.
+    IF SQLERRM LIKE '%only change your own collections%' THEN
+      RAISE NOTICE 'ok  an agent cannot edit another agent''s collection';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+
+  -- The rule is ownership, not status: the same agent may edit their *own*
+  -- in_progress collection.
+  UPDATE public.collections SET notes = 'mine to touch'
+  WHERE id = 'f1000000-0000-4000-8000-000000000002';
+
+  PERFORM pg_temp.assert(
+    (SELECT notes FROM public.collections
+      WHERE id = 'f1000000-0000-4000-8000-000000000002'),
+    'mine to touch', 'an agent can still edit their own collection');
+END;
+$$;
+
+-- Row visibility, which is RLS and not a trigger.
+--
+-- This has to run as `authenticated`. The rest of the suite connects as the
+-- superuser, and a superuser bypasses row security entirely -- so asserting on
+-- which rows come back while still superuser would pass no matter what the
+-- policy said, which is exactly the failure mode this block exists to catch.
+SET LOCAL ROLE authenticated;
+
+DO $$
+DECLARE
+  v_count INT;
+BEGIN
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2agentTEST000000000002',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'agent')
+  )::TEXT);
+
+  SELECT count(*) INTO v_count FROM public.collections
+  WHERE id = 'f1000000-0000-4000-8000-000000000001';
+  PERFORM pg_temp.assert(v_count::TEXT, '0',
+    'an agent does not even see another agent''s collection');
+
+  SELECT count(*) INTO v_count FROM public.collections
+  WHERE id = 'f1000000-0000-4000-8000-000000000002';
+  PERFORM pg_temp.assert(v_count::TEXT, '1',
+    'an agent still sees their own collection');
+
+  -- A manager still sees the whole route, which is the point of the role.
+  PERFORM pg_temp.set_claims(jsonb_build_object(
+    'sub', 'user_2managerTEST00000000001',
+    'role', 'authenticated',
+    'app_metadata', jsonb_build_object(
+      'company_id', '11111111-1111-1111-1111-111111111111', 'role', 'manager')
+  )::TEXT);
+
+  SELECT count(*) INTO v_count FROM public.collections
+  WHERE id = 'f1000000-0000-4000-8000-000000000001';
+  PERFORM pg_temp.assert(v_count::TEXT, '1',
+    'a manager still sees the whole route');
+END;
+$$;
+
+-- Back to the superuser for the remaining checks. SET LOCAL would be scoped to
+-- the transaction, but RESET is the form Postgres accepts here.
+RESET ROLE;
+
+-- ── 11e. GSTR-3B exists, and GSTR-1 groups by HSN ─────────────────────────
+-- More than one bucket is expected: the seeded invoices and the current-month
+-- stock entries land in different months, and a per-month return is the point.
+SELECT pg_temp.assert_true(
+  (SELECT count(*) >= 1 FROM public.gstr3b_report),
+  'the GSTR-3B report exists and covers the seeded period');
+
+-- Every bucket balances on its own terms: net payable is outward less inward,
+-- row by row. Aggregating first would let two unbalanced buckets cancel out.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr3b_report
+    WHERE net_tax_payable IS DISTINCT FROM (output_tax - input_tax_credit)
+  ),
+  'GSTR-3B net tax payable is outward tax less input credit in every month');
+
+-- Output tax is the tax actually billed, so it cannot exceed the total tax on
+-- every non-cancelled invoice. A draft that leaked into the return would break
+-- this, which is the regression it exists to catch.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr3b_report g
+    WHERE g.output_tax > (
+      SELECT COALESCE(SUM(i.cgst + i.sgst + i.igst), 0) FROM public.invoices i
+      WHERE i.status <> 'cancelled'
+    )
+  ),
+  'GSTR-3B output tax never exceeds the tax on issued bills');
+
+-- The components must not overlap. A purchase is either CGST+SGST or IGST, so
+-- claiming all three at once would inflate input credit roughly twofold and
+-- understate the tax payable.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr3b_report g
+    WHERE g.input_cgst > 0 AND g.input_igst > 0
+  ),
+  'GSTR-3B never claims CGST and IGST on the same inward supply');
+
+-- Input credit is claimed on inward value, scaled by the rate, not on the full
+-- value. This is the assertion that would have caught the triple-count.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr3b_report g
+    WHERE g.input_tax_credit > g.inward_supplies
+  ),
+  'GSTR-3B claims no more input credit than the inward value it is claimed on');
+
+-- The view must be derived, not hardcoded like the CSV used to be.
+SELECT pg_temp.assert_true(
+  (SELECT pg_get_viewdef('public.gstr3b_report'::regclass, true) LIKE '%stock_entries%'),
+  'inward supplies come from the purchase ledger rather than a placeholder');
+
+-- GSTR-1 is grouped by HSN and rate, which is what the return requires.
+SELECT pg_temp.assert_true(
+  EXISTS (SELECT 1 FROM pg_views
+          WHERE schemaname = 'public' AND viewname = 'gstr1_report'
+            AND definition LIKE '%bill_items%'),
+  'GSTR-1 is built from the bill lines, grouped by HSN and rate');
+
+-- Aggregation is real, not one row per invoice. A second bill for the same HSN
+-- is issued first, so the report has something to aggregate: with a single bill
+-- the check would pass whether or not the GROUP BY worked at all.
+DO $$
+DECLARE
+  v_before  INT;
+  v_after   INT;
+  i         INT;
+BEGIN
+  SELECT count(*) INTO v_before FROM public.invoices
+  WHERE public.invoice_is_collectible(status);
+
+  -- Two separate bills to the SAME restaurant, so they share a supply type and
+-- the report genuinely has something to aggregate. Issued one collection at a
+-- time: billing them together would produce a single bill and prove nothing.
+  PERFORM pg_temp.become('11111111-1111-1111-1111-111111111111', 'owner',
+                         'user_2ownerTEST000000000001');
+
+  FOR i IN 1..2 LOOP
+    -- Take the next uninvoiced collection with lines on it.
+    UPDATE public.collections SET status = 'verified'
+    WHERE id = (
+      SELECT c.id FROM public.collections c
+      JOIN public.collection_items ci ON ci.collection_id = c.id
+      WHERE c.restaurant_id = 'f0000000-0000-4000-8000-00000000000a'
+        AND c.invoice_id IS NULL
+      GROUP BY c.id
+      LIMIT 1);
+
+    PERFORM public.generate_bulk_invoice(
+      ARRAY(SELECT id FROM public.collections
+            WHERE restaurant_id = 'f0000000-0000-4000-8000-00000000000a'
+              AND invoice_id IS NULL AND status = 'verified'));
+
+    -- Billing now produces a draft (migration 32), and a draft is not part of a
+    -- GST return. It has to be approved and issued to belong in GSTR-1.
+    PERFORM pg_temp.assert(
+      (SELECT count(*)::TEXT FROM public.invoices WHERE status = 'draft'
+         AND restaurant_id = 'f0000000-0000-4000-8000-00000000000a'), '1',
+      'billing produces a draft rather than an issued bill');
+
+    PERFORM public.approve_invoice(
+      (SELECT id FROM public.invoices
+        WHERE restaurant_id = 'f0000000-0000-4000-8000-00000000000a'
+          AND status = 'draft' LIMIT 1));
+
+    PERFORM public.send_invoice(
+      (SELECT id FROM public.invoices
+        WHERE restaurant_id = 'f0000000-0000-4000-8000-00000000000a'
+          AND status = 'approved' LIMIT 1));
+  END LOOP;
+
+  SELECT count(*) INTO v_after FROM public.invoices
+  WHERE public.invoice_is_collectible(status);
+
+  PERFORM pg_temp.assert(v_after::TEXT, (v_before + 2)::TEXT,
+    'two more bills were issued for the aggregation check');
+END;
+$$;
+
+-- Aggregation is real, not one row per invoice.
+--
+-- Scoped within a supply type on purpose: GSTR-1 is filed as separate B2B and
+-- B2CS tables, so the two probe restaurants land in different rows by design.
+-- What must hold is that several bills of one HSN, rate and supply type collapse
+-- into one line.
+SELECT pg_temp.assert_true(
+  EXISTS (
+    SELECT 1 FROM public.gstr1_report g
+    WHERE g.invoice_count > 1
+      AND (SELECT count(*) FROM public.gstr1_report g2
+           WHERE g2.hsn_code = g.hsn_code
+             AND g2.gst_rate = g.gst_rate
+             AND g2.supply_type = g.supply_type
+             AND g2.company_id = g.company_id) = 1
+  ),
+  'GSTR-1 aggregates several bills of one HSN into a single line');
+
+-- Distinct invoices are counted, not duplicated by their lines. A bill with two
+-- bill_items still counts once.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr1_report g
+    WHERE g.invoice_count > (
+      SELECT count(DISTINCT i.id) FROM public.bill_items bi
+      JOIN public.invoices i ON i.id = bi.invoice_id
+      WHERE bi.hsn_code = g.hsn_code AND public.invoice_is_collectible(i.status)
+    )
+  ),
+  'GSTR-1 counts distinct bills, not bill lines');
+
+-- And a draft never appears: an unsent bill is not part of the return.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr1_report g
+    WHERE g.invoice_count > (
+      SELECT COUNT(*) FROM public.invoices i
+      WHERE public.invoice_is_collectible(i.status)
+    )
+  ),
+  'GSTR-1 counts no more issued bills than actually exist');
+
+-- The tax on the report equals the tax on the underlying lines, or the
+-- accountant is reconciling against a number nothing supports.
+SELECT pg_temp.assert_true(
+  NOT EXISTS (
+    SELECT 1 FROM public.gstr1_report g
+    WHERE g.total_tax <> g.cgst + g.sgst + g.igst
+  ),
+  'GSTR-1 total tax is the sum of its components');
+
+-- ── 11f. Units of measure, instead of a hardcoded kg ─────────────────────
+SELECT pg_temp.assert(
+  (SELECT unit FROM public.products WHERE id = '88888888-8888-8888-8888-888888888888'),
+  'unit', 'a product carries its own unit of measure');
+
+-- The unit is constrained, so a typo cannot become a unit nobody can read.
+DO $$
+BEGIN
+  BEGIN
+    UPDATE public.products SET unit = 'furlongs' WHERE id = '88888888-8888-8888-8888-888888888888';
+    RAISE EXCEPTION 'FAILED: an unrecognised unit should be refused';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%products_unit_check%' THEN
+      RAISE NOTICE 'ok  an unrecognised unit of measure is refused';
+    ELSE
+      RAISE;
+    END IF;
+  END;
+END;
+$$;
 
 ROLLBACK;
 

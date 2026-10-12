@@ -81,6 +81,7 @@ export type InventoryItem = {
   product_name: string
   hsn_code?: string
   quantity: number
+  unit?: string
   min_stock_level: number
   is_low_stock: boolean
   last_updated: string
@@ -240,6 +241,8 @@ export type Product = {
   hsn_code: string
   gst_rate: number
   price: number
+  unit?: string
+  quantity_scale?: number
   is_active: boolean
   min_stock_level: number
 }

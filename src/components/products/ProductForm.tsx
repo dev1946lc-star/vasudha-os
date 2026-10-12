@@ -29,6 +29,8 @@ export function ProductForm({ initialData, onSubmit }: ProductFormProps) {
       price: 0,
       gst_rate: 5.0,
       min_stock_level: 0,
+      unit: "unit",
+      quantity_scale: 1,
       is_active: true,
     },
   })
@@ -112,6 +114,43 @@ export function ProductForm({ initialData, onSubmit }: ProductFormProps) {
             className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
           />
           {errors.min_stock_level && <p className="mt-1 text-sm text-red-600">{errors.min_stock_level.message}</p>}
+        </div>
+
+        <div className="col-span-2 md:col-span-1">
+          <label className="block text-sm font-medium text-slate-700">Unit of Measure</label>
+          <select
+            {...register("unit")}
+            className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md focus:ring-blue-500 focus:border-blue-500 sm:text-sm bg-white"
+          >
+            <option value="unit">unit (General unit)</option>
+            <option value="can">can (Water / Oil Can)</option>
+            <option value="kg">kg (Kilogram)</option>
+            <option value="g">g (Gram)</option>
+            <option value="l">l (Litre)</option>
+            <option value="litre">litre (Litre)</option>
+            <option value="ml">ml (Millilitre)</option>
+            <option value="pouch">pouch (Milk / Liquid Pouch)</option>
+            <option value="crate">crate (Crate)</option>
+            <option value="bottle">bottle (Bottle)</option>
+            <option value="piece">piece (Piece)</option>
+            <option value="bag">bag (Bag)</option>
+            <option value="box">box (Box)</option>
+            <option value="roll">roll (Roll)</option>
+          </select>
+          {errors.unit && <p className="mt-1 text-sm text-red-600">{errors.unit.message}</p>}
+        </div>
+
+        <div className="col-span-2 md:col-span-1">
+          <label className="block text-sm font-medium text-slate-700">Quantity Scale</label>
+          <input
+            type="number"
+            step="0.001"
+            {...register("quantity_scale")}
+            className="mt-1 block w-full px-3 py-2 border border-slate-300 rounded-md focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+            placeholder="1.000"
+          />
+          <p className="mt-1 text-xs text-slate-400">Fractional precision (e.g. 0.250 for 250ml pouch).</p>
+          {errors.quantity_scale && <p className="mt-1 text-sm text-red-600">{errors.quantity_scale.message}</p>}
         </div>
 
         <div className="col-span-2 flex items-center mt-2">
