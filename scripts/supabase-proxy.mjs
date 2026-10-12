@@ -97,7 +97,7 @@ const server = http.createServer((req, res) => {
         })
         headers['authorization'] = `Bearer ${token}`
       } else {
-        const userId = payload.sub || payload.id || 'user_anonymous'
+        const userId = payload.sub || payload.id || 'user_3Hp4JvXRtyMajsEv5s7E8vS2y0N'
         const appMeta = payload.app_metadata || {}
         const rawCompanyId =
           appMeta.company_id ||
@@ -140,7 +140,7 @@ const server = http.createServer((req, res) => {
   if (!headers['authorization']) {
     const defaultToken = createJwt({
       role: 'authenticated',
-      sub: 'user_anonymous',
+      sub: 'user_3Hp4JvXRtyMajsEv5s7E8vS2y0N',
       aud: 'authenticated',
       app_metadata: {
         company_id: DEFAULT_COMPANY_ID,
