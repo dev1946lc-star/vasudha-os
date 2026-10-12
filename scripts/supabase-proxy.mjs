@@ -99,19 +99,25 @@ const server = http.createServer((req, res) => {
       } else {
         const userId = payload.sub || payload.id || 'user_anonymous'
         const appMeta = payload.app_metadata || {}
-        const companyId =
+        const rawCompanyId =
           appMeta.company_id ||
           payload.company_id ||
           payload.public_metadata?.company_id ||
-          payload.private_metadata?.company_id ||
-          DEFAULT_COMPANY_ID
+          payload.private_metadata?.company_id
+
+        const isUuid = (val) =>
+          typeof val === 'string' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)
+
+        const companyId = isUuid(rawCompanyId) ? rawCompanyId : DEFAULT_COMPANY_ID
 
         let role =
           appMeta.role ||
           payload.public_metadata?.role ||
           payload.private_metadata?.role
 
-        if (!role || role === 'authenticated') {
+        const validRoles = ['owner', 'manager', 'agent', 'accountant']
+        if (!role || !validRoles.includes(role)) {
           role = 'owner'
         }
 
