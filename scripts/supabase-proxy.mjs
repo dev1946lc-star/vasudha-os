@@ -48,16 +48,26 @@ function parseJwt(token) {
 const server = http.createServer((req, res) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} (Origin: ${req.headers.origin || 'none'})`)
 
-  // Comprehensive CORS and Private Network Access headers
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD')
-  res.setHeader('Access-Control-Allow-Headers', 'authorization, apikey, content-type, prefer, x-client-info, x-company-id, range, x-upsert')
-  res.setHeader('Access-Control-Expose-Headers', 'content-range, range-unit, content-length')
-  res.setHeader('Access-Control-Allow-Credentials', 'true')
-  res.setHeader('Access-Control-Allow-Private-Network', 'true')
+  const origin = req.headers.origin || 'http://localhost:3000'
+  const requestedHeaders = req.headers['access-control-request-headers']
+  const allowHeaders = requestedHeaders || 'authorization, apikey, content-type, content-profile, accept-profile, prefer, x-client-info, x-company-id, range, x-upsert'
+
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': allowHeaders,
+    'Access-Control-Expose-Headers': 'content-range, range-unit, content-length, content-profile, accept-profile',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Private-Network': 'true',
+  }
+
+  // Set default CORS headers
+  for (const [key, val] of Object.entries(corsHeaders)) {
+    res.setHeader(key, val)
+  }
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204)
+    res.writeHead(204, corsHeaders)
     res.end()
     return
   }
@@ -130,7 +140,16 @@ const server = http.createServer((req, res) => {
   }
 
   const proxyReq = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers)
+    const responseHeaders = {
+      ...proxyRes.headers,
+      'access-control-allow-origin': origin,
+      'access-control-allow-credentials': 'true',
+      'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
+      'access-control-allow-headers': allowHeaders,
+      'access-control-expose-headers': 'content-range, range-unit, content-length, content-profile, accept-profile',
+      'access-control-allow-private-network': 'true',
+    }
+    res.writeHead(proxyRes.statusCode, responseHeaders)
     proxyRes.pipe(res, { end: true })
   })
 
